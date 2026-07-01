@@ -1,0 +1,82 @@
+//@version=6
+strategy("Price EMA Confirm TP/SL", overlay=true, pyramiding=0, calc_on_every_tick=true, process_orders_on_close=false)
+
+emaLen = input.int(21, "EMA Length", minval=1)
+confirmBars = input.int(1, "Confirm Candles", minval=1, maxval=10)
+tpPoints = input.float(400.0, "Take Profit Points", minval=0.0, step=1.0)
+slPoints = input.float(400.0, "Stop Loss Points", minval=0.0, step=1.0)
+reverseOnFlip = input.bool(false, "Reverse On Flip")
+useSessionFilter = input.bool(true, "Use Session Filter")
+showTokyo = input.bool(true, "Trade Tokyo")
+tokyoSession = input.session("0900-1500", "Tokyo Session")
+tokyoTZ = input.string("Asia/Tokyo", "Tokyo Timezone")
+showLondon = input.bool(true, "Trade London")
+londonSession = input.session("0830-1630", "London Session")
+londonTZ = input.string("Europe/London", "London Timezone")
+showNewYork = input.bool(true, "Trade New York")
+newYorkSession = input.session("0930-1600", "New York Session")
+newYorkTZ = input.string("America/New_York", "New York Timezone")
+
+emaValue = ta.ema(close, emaLen)
+point = syminfo.mintick
+tpDist = tpPoints * point
+slDist = slPoints * point
+bracketOnly = tpPoints > 0 and slPoints > 0
+
+above = close > emaValue
+below = close < emaValue
+
+var int aboveCount = 0
+var int belowCount = 0
+var int activeSignal = 0
+
+if above
+    aboveCount += 1
+    belowCount := 0
+else if below
+    belowCount += 1
+    aboveCount := 0
+else
+    aboveCount := 0
+    belowCount := 0
+
+longSignal = aboveCount >= confirmBars and activeSignal != 1
+shortSignal = belowCount >= confirmBars and activeSignal != -1
+inTokyo = showTokyo and not na(time("", tokyoSession, tokyoTZ))
+inLondon = showLondon and not na(time("", londonSession, londonTZ))
+inNewYork = showNewYork and not na(time("", newYorkSession, newYorkTZ))
+canEnter = not useSessionFilter or inTokyo or inLondon or inNewYork
+longEntrySignal = longSignal and canEnter
+shortEntrySignal = shortSignal and canEnter
+
+if longEntrySignal
+    activeSignal := 1
+if shortEntrySignal
+    activeSignal := -1
+
+if longEntrySignal
+    if strategy.position_size < 0 and not bracketOnly
+        strategy.close("Short", comment="Flip Close")
+    if strategy.position_size == 0 or (reverseOnFlip and not bracketOnly)
+        strategy.entry("Long", strategy.long, comment="Long")
+
+if shortEntrySignal
+    if strategy.position_size > 0 and not bracketOnly
+        strategy.close("Long", comment="Flip Close")
+    if strategy.position_size == 0 or (reverseOnFlip and not bracketOnly)
+        strategy.entry("Short", strategy.short, comment="Short")
+
+if strategy.position_size > 0
+    longLimit = tpPoints > 0 ? strategy.position_avg_price + tpDist : na
+    longStop = slPoints > 0 ? strategy.position_avg_price - slDist : na
+    strategy.exit("Long TP/SL", "Long", limit=longLimit, stop=longStop)
+
+if strategy.position_size < 0
+    shortLimit = tpPoints > 0 ? strategy.position_avg_price - tpDist : na
+    shortStop = slPoints > 0 ? strategy.position_avg_price + slDist : na
+    strategy.exit("Short TP/SL", "Short", limit=shortLimit, stop=shortStop)
+
+plot(emaValue, "EMA", color=color.orange, linewidth=2)
+bgcolor(canEnter ? color.new(color.green, 92) : na, title="Trade Session")
+plotshape(longEntrySignal, "Long Entry Signal", shape.triangleup, location.belowbar, color=color.lime, size=size.tiny)
+plotshape(shortEntrySignal, "Short Entry Signal", shape.triangledown, location.abovebar, color=color.red, size=size.tiny)

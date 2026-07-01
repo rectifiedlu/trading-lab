@@ -1,0 +1,87 @@
+//@version=6
+strategy("XAUUSD Z-Score Mean Reversion Scalper", overlay=true, pyramiding=0, calc_on_every_tick=true)
+
+emaLen = input.int(100, "Fair Value EMA", minval=1)
+volLen = input.int(100, "Volatility Length", minval=5)
+entryZ = input.float(2.0, "Entry Z", minval=0.1, step=0.1)
+exitZ = input.float(0.2, "Exit Z", minval=0.0, step=0.1)
+stopZ = input.float(3.5, "Stop Z (0 = off)", minval=0.0, step=0.1)
+
+tpPoints = input.float(0, "Take Profit Points (0 = off)", minval=0)
+slPoints = input.float(0, "Stop Loss Points (0 = off)", minval=0)
+pointSize = input.float(0.01, "Point Size", minval=0.00001)
+
+useSlopeFilter = input.bool(true, "Use EMA Slope Filter")
+slopeLen = input.int(20, "Slope Lookback", minval=1)
+maxSlopePoints = input.float(120, "Max EMA Slope Points", minval=0)
+
+cooldownBars = input.int(0, "Cooldown Bars After Closed Trade", minval=0)
+
+fair = ta.ema(close, emaLen)
+dev = close - fair
+vol = ta.stdev(close - fair, volLen)
+z = vol > 0 ? dev / vol : 0.0
+
+slopePoints = math.abs(fair - fair[slopeLen]) / pointSize
+slopeOk = not useSlopeFilter or slopePoints <= maxSlopePoints
+
+var int lastClosedCount = 0
+var int cooldownUntil = na
+
+if strategy.closedtrades > lastClosedCount
+    cooldownUntil := bar_index + cooldownBars
+    lastClosedCount := strategy.closedtrades
+
+cooldownOk = na(cooldownUntil) or bar_index >= cooldownUntil
+
+longSignal = z <= -entryZ and slopeOk and cooldownOk
+shortSignal = z >= entryZ and slopeOk and cooldownOk
+
+longExit = z >= -exitZ
+shortExit = z <= exitZ
+
+longStopZ = stopZ > 0 and z <= -stopZ
+shortStopZ = stopZ > 0 and z >= stopZ
+
+if strategy.position_size == 0 and longSignal
+    strategy.entry("Long", strategy.long)
+
+if strategy.position_size == 0 and shortSignal
+    strategy.entry("Short", strategy.short)
+
+if strategy.position_size > 0 and (longExit or longStopZ)
+    strategy.close("Long", comment=longStopZ ? "Z Stop Long" : "Mean Exit Long")
+
+if strategy.position_size < 0 and (shortExit or shortStopZ)
+    strategy.close("Short", comment=shortStopZ ? "Z Stop Short" : "Mean Exit Short")
+
+tpDist = tpPoints * pointSize
+slDist = slPoints * pointSize
+
+if strategy.position_size > 0 and (tpPoints > 0 or slPoints > 0)
+    strategy.exit(
+         "Long TP/SL",
+         "Long",
+         limit=tpPoints > 0 ? strategy.position_avg_price + tpDist : na,
+         stop=slPoints > 0 ? strategy.position_avg_price - slDist : na)
+
+if strategy.position_size < 0 and (tpPoints > 0 or slPoints > 0)
+    strategy.exit(
+         "Short TP/SL",
+         "Short",
+         limit=tpPoints > 0 ? strategy.position_avg_price - tpDist : na,
+         stop=slPoints > 0 ? strategy.position_avg_price + slDist : na)
+
+plot(fair, "Fair Value EMA", color=color.orange, linewidth=2)
+upperEntry = fair + entryZ * vol
+lowerEntry = fair - entryZ * vol
+upperExit = fair + exitZ * vol
+lowerExit = fair - exitZ * vol
+
+plot(upperEntry, "+Entry Z", color=color.new(color.red, 0))
+plot(lowerEntry, "-Entry Z", color=color.new(color.lime, 0))
+plot(upperExit, "+Exit Z", color=color.new(color.red, 70))
+plot(lowerExit, "-Exit Z", color=color.new(color.lime, 70))
+
+plotshape(longSignal and strategy.position_size == 0, title="Long Signal", style=shape.triangleup, color=color.lime, size=size.tiny, location=location.belowbar, text="L")
+plotshape(shortSignal and strategy.position_size == 0, title="Short Signal", style=shape.triangledown, color=color.red, size=size.tiny, location=location.abovebar, text="S")

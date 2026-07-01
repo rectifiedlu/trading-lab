@@ -1,0 +1,92 @@
+//@version=5
+strategy("RSI Bounce TP/SL Strategy", overlay=true, pyramiding=0, initial_capital=50,
+     default_qty_type=strategy.fixed, default_qty_value=1)
+
+// Use on XAUUSD. For XAUUSD with 2 decimals, 1 point = 0.01.
+rsiLen = input.int(10, "RSI Length", minval=1)
+longLevel = input.float(30.0, "Long Arm RSI <=", step=0.1)
+shortLevel = input.float(68.0, "Short Arm RSI >=", step=0.1)
+bounce = input.float(4.0, "RSI Bounce", step=0.1)
+tpPoints = input.float(750.0, "TP Points", step=1)
+slPoints = input.float(0.0, "SL Points (0 = off)", step=1)
+pointSize = input.float(0.01, "Point Size", step=0.001)
+allowLong = input.bool(true, "Allow Long")
+allowShort = input.bool(true, "Allow Short")
+
+rsi = ta.rsi(close, rsiLen)
+tpDist = tpPoints * pointSize
+slDist = slPoints * pointSize
+
+var bool longArmed = false
+var float longLow = na
+var bool shortArmed = false
+var float shortHigh = na
+
+flat = strategy.position_size == 0
+
+if flat
+    if allowLong and rsi <= longLevel
+        longArmed := true
+        longLow := na(longLow) ? rsi : math.min(longLow, rsi)
+
+    if allowShort and rsi >= shortLevel
+        shortArmed := true
+        shortHigh := na(shortHigh) ? rsi : math.max(shortHigh, rsi)
+
+longReady = flat and longArmed and rsi >= longLow + bounce
+shortReady = flat and shortArmed and rsi <= shortHigh - bounce
+
+// If both somehow trigger on same bar, take the stronger bounce.
+if longReady and shortReady
+    longScore = rsi - (longLow + bounce)
+    shortScore = (shortHigh - bounce) - rsi
+    longReady := longScore >= shortScore
+    shortReady := shortScore > longScore
+
+if longReady
+    strategy.entry("L", strategy.long)
+    longArmed := false
+    shortArmed := false
+    longLow := na
+    shortHigh := na
+
+if shortReady
+    strategy.entry("S", strategy.short)
+    longArmed := false
+    shortArmed := false
+    longLow := na
+    shortHigh := na
+
+if strategy.position_size > 0
+    longStop = slPoints > 0 ? strategy.position_avg_price - slDist : na
+    strategy.exit("L exit", "L", limit=strategy.position_avg_price + tpDist, stop=longStop)
+
+if strategy.position_size < 0
+    shortStop = slPoints > 0 ? strategy.position_avg_price + slDist : na
+    strategy.exit("S exit", "S", limit=strategy.position_avg_price - tpDist, stop=shortStop)
+
+// Clear stale arms while holding.
+if not flat
+    longArmed := false
+    shortArmed := false
+    longLow := na
+    shortHigh := na
+
+plotshape(longReady, title="Long Trigger", style=shape.triangleup, location=location.belowbar,
+     color=color.lime, size=size.small, text="L")
+plotshape(shortReady, title="Short Trigger", style=shape.triangledown, location=location.abovebar,
+     color=color.red, size=size.small, text="S")
+
+plot(strategy.position_size > 0 ? strategy.position_avg_price + tpDist : na,
+     "Long TP", color=color.new(color.lime, 0), style=plot.style_linebr)
+plot(strategy.position_size > 0 and slPoints > 0 ? strategy.position_avg_price - slDist : na,
+     "Long SL", color=color.new(color.red, 0), style=plot.style_linebr)
+plot(strategy.position_size < 0 ? strategy.position_avg_price - tpDist : na,
+     "Short TP", color=color.new(color.lime, 0), style=plot.style_linebr)
+plot(strategy.position_size < 0 and slPoints > 0 ? strategy.position_avg_price + slDist : na,
+     "Short SL", color=color.new(color.red, 0), style=plot.style_linebr)
+
+// RSI display in a separate pane is not possible from an overlay strategy, so expose values in data window.
+plot(rsi, "RSI (data window)", display=display.data_window)
+plot(longArmed ? longLow : na, "Long armed RSI low", display=display.data_window)
+plot(shortArmed ? shortHigh : na, "Short armed RSI high", display=display.data_window)

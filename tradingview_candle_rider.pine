@@ -1,0 +1,104 @@
+//@version=6
+strategy("Candle Rider", overlay=true, pyramiding=0, calc_on_every_tick=true, process_orders_on_close=false, initial_capital=50, margin_long=1, margin_short=1)
+
+// Mirrors forex_candle_rider_backtest.py:
+// - Green close candle = long signal, red close candle = short signal.
+// - Invert flips signal direction.
+// - confirm=0 acts on first colored candle, confirm=1 requires two same-color closes.
+// - tp/sl > 0 use fixed price exits.
+// - tp=0 closes profitable trades on opposite confirmed candle.
+// - sl=0 closes losing trades on opposite confirmed candle, optionally reversing.
+
+mode = input.string("normal", "Mode", options=["normal", "invert"])
+confirmBars = input.int(0, "Confirm", minval=0, maxval=1)
+tpPoints = input.float(100.0, "TP points (0 = signal profit exit)", minval=0.0)
+slPoints = input.float(0.0, "SL points (0 = signal loss exit)", minval=0.0)
+pointSize = input.float(0.01, "Point size", minval=0.000001)
+reverseOnSL = input.bool(false, "Reverse on SL / loss signal")
+showLevels = input.bool(true, "Show TP/SL levels")
+tradeQty = input.float(1.0, "Trade quantity", minval=0.0001)
+
+rawDir = close > open ? 1 : close < open ? -1 : 0
+sigDir = mode == "invert" ? -rawDir : rawDir
+
+var int streakDir = 0
+var int streakCount = 0
+if barstate.isconfirmed
+    if sigDir == 0
+        streakDir := 0
+        streakCount := 0
+    else if sigDir == streakDir
+        streakCount += 1
+    else
+        streakDir := sigDir
+        streakCount := 1
+
+confirmedDir = barstate.isconfirmed and sigDir != 0 and streakCount >= confirmBars + 1 ? sigDir : 0
+longSignal = confirmedDir == 1
+shortSignal = confirmedDir == -1
+
+pos = strategy.position_size
+entry = strategy.position_avg_price
+longPnlPts = pos > 0 ? (close - entry) / pointSize : na
+shortPnlPts = pos < 0 ? (entry - close) / pointSize : na
+
+longOpp = pos > 0 and shortSignal
+shortOpp = pos < 0 and longSignal
+longProfitSignalExit = tpPoints == 0 and longOpp and longPnlPts > 0
+shortProfitSignalExit = tpPoints == 0 and shortOpp and shortPnlPts > 0
+longLossSignalExit = slPoints == 0 and longOpp and longPnlPts < 0
+shortLossSignalExit = slPoints == 0 and shortOpp and shortPnlPts < 0
+
+// Fixed TP/SL. Historical fills are TradingView-emulator behavior, not exact Python tick fills.
+if pos > 0 and (tpPoints > 0 or slPoints > 0)
+    longLimit = tpPoints > 0 ? entry + tpPoints * pointSize : na
+    longStop = slPoints > 0 ? entry - slPoints * pointSize : na
+    strategy.exit("XL", "L", limit=longLimit, stop=longStop)
+
+if pos < 0 and (tpPoints > 0 or slPoints > 0)
+    shortLimit = tpPoints > 0 ? entry - tpPoints * pointSize : na
+    shortStop = slPoints > 0 ? entry + slPoints * pointSize : na
+    strategy.exit("XS", "S", limit=shortLimit, stop=shortStop)
+
+// Signal exits only apply to the disabled side of the bracket.
+if longProfitSignalExit
+    strategy.close("L", comment="profit_signal_close")
+if shortProfitSignalExit
+    strategy.close("S", comment="profit_signal_close")
+
+if longLossSignalExit
+    strategy.close("L", comment="loss_signal_close")
+    if reverseOnSL
+        strategy.entry("S", strategy.short, qty=tradeQty, comment="reverse_sl_signal")
+
+if shortLossSignalExit
+    strategy.close("S", comment="loss_signal_close")
+    if reverseOnSL
+        strategy.entry("L", strategy.long, qty=tradeQty, comment="reverse_sl_signal")
+
+// Optional fixed-SL reversal approximation. This is visual/TV-emulator logic, not exact tick replay.
+fixedLongStopHit = reverseOnSL and slPoints > 0 and pos > 0 and low <= entry - slPoints * pointSize
+fixedShortStopHit = reverseOnSL and slPoints > 0 and pos < 0 and high >= entry + slPoints * pointSize
+if fixedLongStopHit
+    strategy.close("L", comment="fixed_sl_reverse")
+    strategy.entry("S", strategy.short, qty=tradeQty, comment="fixed_sl_reverse")
+if fixedShortStopHit
+    strategy.close("S", comment="fixed_sl_reverse")
+    strategy.entry("L", strategy.long, qty=tradeQty, comment="fixed_sl_reverse")
+
+// Natural entry when flat.
+if pos == 0
+    if longSignal
+        strategy.entry("L", strategy.long, qty=tradeQty, comment="long_candle")
+    else if shortSignal
+        strategy.entry("S", strategy.short, qty=tradeQty, comment="short_candle")
+
+tpLine = showLevels and pos > 0 and tpPoints > 0 ? entry + tpPoints * pointSize : showLevels and pos < 0 and tpPoints > 0 ? entry - tpPoints * pointSize : na
+slLine = showLevels and pos > 0 and slPoints > 0 ? entry - slPoints * pointSize : showLevels and pos < 0 and slPoints > 0 ? entry + slPoints * pointSize : na
+plot(tpLine, "TP", color=color.new(color.lime, 0), linewidth=2, style=plot.style_linebr)
+plot(slLine, "SL", color=color.new(color.red, 0), linewidth=2, style=plot.style_linebr)
+
+plotshape(longSignal, "Confirmed Long Candle", shape.triangleup, location.belowbar, color=color.new(color.lime, 0), size=size.tiny, text="L")
+plotshape(shortSignal, "Confirmed Short Candle", shape.triangledown, location.abovebar, color=color.new(color.red, 0), size=size.tiny, text="S")
+plotshape(longProfitSignalExit or shortProfitSignalExit, "Profit Signal Exit", shape.circle, location.abovebar, color=color.new(color.aqua, 0), size=size.tiny, text="PX")
+plotshape(longLossSignalExit or shortLossSignalExit, "Loss Signal Exit", shape.circle, location.belowbar, color=color.new(color.orange, 0), size=size.tiny, text="LX")

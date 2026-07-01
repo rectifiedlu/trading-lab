@@ -1,0 +1,93 @@
+//@version=6
+strategy("Pure Trailing Entry Exit Scalper", overlay=true, pyramiding=0, calc_on_every_tick=true)
+
+entryTrailPoints = input.float(100, "Entry Trail Points", minval=1)
+exitTrailPoints = input.float(150, "Exit Trail Points", minval=1)
+pointSize = input.float(0.01, "Point Size", minval=0.00001)
+
+allowLong = input.bool(true, "Allow Long")
+allowShort = input.bool(true, "Allow Short")
+reverseOnExit = input.bool(false, "Reverse On Exit")
+
+entryTrail = entryTrailPoints * pointSize
+exitTrail = exitTrailPoints * pointSize
+
+var float lowRef = na
+var float highRef = na
+var int lastExtreme = 0
+var float bestLong = na
+var float bestShort = na
+var int lastClosedCount = 0
+
+if na(lowRef)
+    lowRef := close
+    highRef := close
+
+flat = strategy.position_size == 0
+
+// Flat mode: track the latest extreme. If the latest extreme was a low,
+// an upward reversal by entryTrail enters long. If it was a high, a downward
+// reversal by entryTrail enters short.
+if flat
+    if close < lowRef
+        lowRef := close
+        lastExtreme := -1
+    if close > highRef
+        highRef := close
+        lastExtreme := 1
+
+    longSignal = allowLong and lastExtreme == -1 and close >= lowRef + entryTrail
+    shortSignal = allowShort and lastExtreme == 1 and close <= highRef - entryTrail
+
+    if longSignal
+        strategy.entry("Long", strategy.long)
+        bestLong := close
+        lowRef := close
+        highRef := close
+        lastExtreme := 0
+    else if shortSignal
+        strategy.entry("Short", strategy.short)
+        bestShort := close
+        lowRef := close
+        highRef := close
+        lastExtreme := 0
+
+// Holding mode: trail only from the best price since entry.
+if strategy.position_size > 0
+    bestLong := na(bestLong) ? close : math.max(bestLong, close)
+    if close <= bestLong - exitTrail
+        if reverseOnExit and allowShort
+            strategy.entry("Short", strategy.short, comment="Trail Reverse Short")
+            bestShort := close
+        else
+            strategy.close("Long", comment="Trail Exit Long")
+        lowRef := close
+        highRef := close
+        lastExtreme := 0
+
+if strategy.position_size < 0
+    bestShort := na(bestShort) ? close : math.min(bestShort, close)
+    if close >= bestShort + exitTrail
+        if reverseOnExit and allowLong
+            strategy.entry("Long", strategy.long, comment="Trail Reverse Long")
+            bestLong := close
+        else
+            strategy.close("Short", comment="Trail Exit Short")
+        lowRef := close
+        highRef := close
+        lastExtreme := 0
+
+// After a normal close, reset references from current price.
+if strategy.closedtrades > lastClosedCount
+    if strategy.position_size == 0
+        lowRef := close
+        highRef := close
+        lastExtreme := 0
+        bestLong := na
+        bestShort := na
+    lastClosedCount := strategy.closedtrades
+
+plot(lowRef, "Flat Low Ref", color=color.new(color.lime, 35))
+plot(highRef, "Flat High Ref", color=color.new(color.red, 35))
+plot(strategy.position_size > 0 ? bestLong : na, "Best Long", color=color.lime, linewidth=2)
+plot(strategy.position_size < 0 ? bestShort : na, "Best Short", color=color.red, linewidth=2)

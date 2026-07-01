@@ -1,0 +1,35 @@
+Promising backtest notes
+========================
+
+2026-05-19
+
+MACD TP/SL, XAUUSD, 14d
+----------------------
+Only positive result seen so far while Volty and Bollinger were net negative.
+
+Result:
+XAUUSD  macd  5m
+mode=candle
+fast=12
+slow=17
+macd_ema=1
+warmup=18
+deadband=0.1
+confirm=1
+reverse=0
+tp=950
+sl=500
+total=$+186.7633
+real=$+186.7633
+trades=116
+winrate=44.8%
+profit_factor=1.58
+drawdown=$59.98
+stops=59
+signal_exits=6
+liquidations=0
+dead=0
+
+Pending comparison:
+- Parabolic SAR sweep
+- EMA pair sweep

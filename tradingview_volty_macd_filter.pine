@@ -1,0 +1,43 @@
+//@version=6
+strategy("Volty Expan Close + MACD Filter", overlay=true, pyramiding=0)
+
+length = input.int(5, "Volty Length")
+numATRs = input.float(0.75, "ATR Mult")
+
+fastLen = input.int(8, "MACD Fast EMA")
+slowLen = input.int(13, "MACD Slow EMA")
+macdSmooth = input.int(1, "MACD Smooth EMA")
+deadband = input.float(0.1, "MACD Deadband")
+
+atrs = ta.sma(ta.tr, length) * numATRs
+longStop = close + atrs
+shortStop = close - atrs
+
+rawMacd = ta.ema(close, fastLen) - ta.ema(close, slowLen)
+macdLine = macdSmooth <= 1 ? rawMacd : ta.ema(rawMacd, macdSmooth)
+
+macdLong = macdLine >= deadband
+macdShort = macdLine <= -deadband
+ready = not na(close[length]) and not na(atrs)
+
+if ready and macdLong
+    strategy.entry("VltClsLE", strategy.long, stop=longStop, comment="VltClsLE")
+else
+    strategy.cancel("VltClsLE")
+
+if ready and macdShort
+    strategy.entry("VltClsSE", strategy.short, stop=shortStop, comment="VltClsSE")
+else
+    strategy.cancel("VltClsSE")
+
+bgcolor(macdLong ? color.new(color.green, 88) : macdShort ? color.new(color.red, 88) : color.new(color.gray, 92))
+
+plot(longStop, "Volty Long Stop", color=color.new(color.lime, 0), style=plot.style_linebr)
+plot(shortStop, "Volty Short Stop", color=color.new(color.red, 0), style=plot.style_linebr)
+
+plotshape(ready and macdLong, title="Allowed Long Stop", style=shape.triangleup, color=color.lime, size=size.tiny, location=location.belowbar, text="L")
+plotshape(ready and macdShort, title="Allowed Short Stop", style=shape.triangledown, color=color.red, size=size.tiny, location=location.abovebar, text="S")
+plotshape(ready and not macdLong, title="Blocked Long Stop", style=shape.xcross, color=color.new(color.lime, 45), size=size.tiny, location=location.belowbar, text="xL")
+plotshape(ready and not macdShort, title="Blocked Short Stop", style=shape.xcross, color=color.new(color.red, 45), size=size.tiny, location=location.abovebar, text="xS")
+
+plot(macdLine, "MACD Line", color=color.aqua, display=display.data_window)

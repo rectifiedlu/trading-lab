@@ -1,0 +1,11 @@
+EMA PAIR PARAM NOTES
+
+fast=6 slow=150 confirm=1 tp=950 sl=450 reverse_tp=on pnl=+225 winrate=44.27 max_pnl_dd=34.52
+fast=6 slow=150 confirm=1 tp=850 sl=450 reverse=off pnl=+160 winrate=50
+fast=6 slow=150 confirm=1 tp=850 sl=450 reverse_tp=on pnl=+239 winrate=48.2 max_pnl_dd=31.59
+fast=6 slow=150 confirm=1 tp=750 sl=450 reverse_tp=on pnl=+182.1 winrate=48.25 max_pnl_dd=22.57
+fast=6 slow=150 confirm=1 tp=500 sl=450 reverse=off pnl=+131 winrate=62.9 max_pnl_dd=15
+fast=6 slow=150 confirm=1 tp=500 sl=450 reverse_sl=on pnl=+151 max_pnl_dd=28
+fast=4 slow=150 confirm=1 tp=500 sl=500 reverse=off pnl=+149 max_pnl_dd=21.44 winrate=66.3
+fast=4 slow=150 confirm=1 tp=500 sl=500 reverse_sl=on pnl=+159 max_pnl_dd=34.98 winrate=62.81
+fast=4 slow=150 confirm=1 tp=550 sl=550 reverse_sl=on pnl=+164.31 winrate=63.33 max_pnl_dd=34.98

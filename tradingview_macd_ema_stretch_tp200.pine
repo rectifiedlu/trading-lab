@@ -1,0 +1,66 @@
+//@version=6
+strategy("XAU MACD EMA-Stretch Gate TP200", overlay=true, pyramiding=0, calc_on_every_tick=true)
+
+// Inputs
+fastLen = input.int(8, "MACD Fast EMA")
+slowLen = input.int(13, "MACD Slow EMA")
+macdSmooth = input.int(1, "MACD Smooth EMA")
+deadband = input.float(0.1, "MACD Deadband")
+
+emaLen = input.int(20, "Stretch EMA")
+atrLen = input.int(14, "ATR Length")
+maxAtrStretch = input.float(0.7, "Max EMA Stretch ATR")
+
+tpPoints = input.float(200, "Take Profit Points")
+pointSize = input.float(0.01, "Point Size")
+
+// MACD line, same style as our code: EMA(fast) - EMA(slow), optionally smoothed.
+rawMacd = ta.ema(close, fastLen) - ta.ema(close, slowLen)
+macdLine = macdSmooth <= 1 ? rawMacd : ta.ema(rawMacd, macdSmooth)
+
+// Stretch gate: skip long entries that are already too far above EMA,
+// and skip short entries that are already too far below EMA.
+basis = ta.ema(close, emaLen)
+atr = ta.atr(atrLen)
+upperBand = basis + atr * maxAtrStretch
+lowerBand = basis - atr * maxAtrStretch
+
+longAllowed = close <= upperBand
+shortAllowed = close >= lowerBand
+
+macdLong = macdLine >= deadband
+macdShort = macdLine <= -deadband
+
+longSignal = macdLong and not macdLong[1] and longAllowed
+shortSignal = macdShort and not macdShort[1] and shortAllowed
+
+tpDist = tpPoints * pointSize
+
+if longSignal and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+
+if shortSignal and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+
+if strategy.position_size > 0
+    strategy.exit("Long TP", "Long", limit=strategy.position_avg_price + tpDist)
+
+if strategy.position_size < 0
+    strategy.exit("Short TP", "Short", limit=strategy.position_avg_price - tpDist)
+
+if strategy.position_size > 0 and not macdLong
+    strategy.close("Long", comment="MACD Exit")
+
+if strategy.position_size < 0 and not macdShort
+    strategy.close("Short", comment="MACD Exit")
+
+plot(basis, "EMA Stretch Basis", color=color.yellow, linewidth=2)
+plot(upperBand, "Upper ATR Stretch Gate", color=color.red)
+plot(lowerBand, "Lower ATR Stretch Gate", color=color.green)
+
+plotshape(longSignal, title="Long Signal", style=shape.triangleup, color=color.lime, size=size.small, location=location.belowbar, text="L")
+plotshape(shortSignal, title="Short Signal", style=shape.triangledown, color=color.red, size=size.small, location=location.abovebar, text="S")
+
+plot(macdLine, "MACD Line", color=color.aqua, display=display.data_window)
+hline(deadband, "MACD +Deadband", color=color.new(color.green, 50), display=display.none)
+hline(-deadband, "MACD -Deadband", color=color.new(color.red, 50), display=display.none)

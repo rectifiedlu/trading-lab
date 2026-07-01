@@ -1,0 +1,99 @@
+//@version=6
+strategy("Keltner Invert Candle-Open Trail", overlay=true, pyramiding=0, process_orders_on_close=false)
+
+length = input.int(34, "Length", minval=1)
+mult = input.float(1.5, "ATR Mult", minval=0.01, step=0.05)
+exitMult = input.float(0.75, "Exit Mult", minval=0.01, step=0.05)
+targetPoints = input.float(800, "Target Points", minval=0)
+trailPoints = input.float(50, "Trail Points", minval=0)
+lossCutPoints = input.float(1200, "Loss Cut Points", minval=0)
+pointSize = input.float(0.01, "Point Size", minval=0.00001)
+block12 = input.bool(true, "Block UTC 12")
+block22 = input.bool(true, "Block UTC 22")
+
+target = targetPoints * pointSize
+trail = trailPoints * pointSize
+lossCut = lossCutPoints * pointSize
+
+center = ta.ema(close, length)
+atr = ta.rma(ta.tr(true), length)
+upper = center + mult * atr
+lower = center - mult * atr
+exitUpper = center + mult * exitMult * atr
+exitLower = center - mult * exitMult * atr
+
+rawState = close > upper ? 1 : close < lower ? -1 : 0
+rawExitState = close > exitUpper ? 1 : close < exitLower ? -1 : 0
+
+// Invert mode: upper-band break fades short, lower-band break fades long.
+state = -rawState
+exitState = -rawExitState
+
+utcHour = hour(time, "UTC")
+entryBlocked = (block12 and utcHour == 12) or (block22 and utcHour == 22)
+
+var int prevState = na
+var float bestOpen = na
+var bool armed = false
+
+pos = strategy.position_size
+avg = strategy.position_avg_price
+
+if na(prevState)
+    prevState := state
+
+entryLong = not entryBlocked and pos == 0 and state == 1 and prevState != 1
+entryShort = not entryBlocked and pos == 0 and state == -1 and prevState != -1
+
+if entryLong
+    strategy.entry("L", strategy.long)
+    bestOpen := na
+    armed := false
+
+if entryShort
+    strategy.entry("S", strategy.short)
+    bestOpen := na
+    armed := false
+
+if pos > 0
+    move = close - avg
+    if trail > 0 and target > 0 and open >= avg + target
+        bestOpen := na(bestOpen) ? open : math.max(bestOpen, open)
+        armed := true
+    if target > 0 and trail == 0 and high >= avg + target
+        strategy.close("L", comment="tp")
+    else if armed and low <= bestOpen - trail
+        strategy.close("L", comment="copen_trail")
+    else if lossCut > 0 and low <= avg - lossCut
+        strategy.close("L", comment="loss_cut")
+    else if exitState == -1 and move < 0
+        strategy.close("L", comment="signal_loss")
+
+if pos < 0
+    move = avg - close
+    if trail > 0 and target > 0 and open <= avg - target
+        bestOpen := na(bestOpen) ? open : math.min(bestOpen, open)
+        armed := true
+    if target > 0 and trail == 0 and low <= avg - target
+        strategy.close("S", comment="tp")
+    else if armed and high >= bestOpen + trail
+        strategy.close("S", comment="copen_trail")
+    else if lossCut > 0 and high >= avg + lossCut
+        strategy.close("S", comment="loss_cut")
+    else if exitState == 1 and move < 0
+        strategy.close("S", comment="signal_loss")
+
+if pos == 0
+    bestOpen := na
+    armed := false
+
+prevState := state
+
+plot(center, "EMA Center", color=color.yellow, linewidth=2)
+plot(upper, "Upper", color=color.new(color.red, 0))
+plot(lower, "Lower", color=color.new(color.lime, 0))
+plot(exitUpper, "Exit Upper", color=color.new(color.red, 65))
+plot(exitLower, "Exit Lower", color=color.new(color.lime, 65))
+plot(bestOpen, "Best Trail Open", color=color.aqua, linewidth=2, style=plot.style_linebr)
+plot(armed and pos > 0 ? bestOpen - trail : na, "Long Trail Stop", color=color.orange, style=plot.style_linebr)
+plot(armed and pos < 0 ? bestOpen + trail : na, "Short Trail Stop", color=color.orange, style=plot.style_linebr)

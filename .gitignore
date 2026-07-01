@@ -1,0 +1,33 @@
+.env
+.env.*
+!.env.example
+.wallet_key.txt
+__pycache__/
+*.pyc
+
+# Local/generated data and heavy outputs
+data/
+archive/
+experiments/
+*.csv
+*.json
+*.pt
+*.pth
+*.pkl
+*.npy
+*.npz
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Local tooling/cache
+.playwright-mcp/
+.pytest_cache/
+.mypy_cache/
+
+# MT5/runtime logs and temporary outputs
+*.log
+*.tmp
+*_smoke.csv
+*_results.csv

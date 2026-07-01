@@ -1,0 +1,53 @@
+//@version=6
+strategy("Volty Expan Close Strategy - Min ATR", overlay=true)
+
+length = input(5, "Length")
+numATRs = input(0.75, "ATR Mult")
+holdCloseMult = input.float(0.75, "Hold Close ATR Mult", minval=0.0, step=0.05)
+minATRPoints = input.float(0, "Min ATR Points (0 = off)", minval=0.0)
+pointSize = input.float(0.01, "Point Size", minval=0.00001)
+
+rawATR = ta.sma(ta.tr, length)
+atrs = rawATR * numATRs
+holdAtrs = rawATR * holdCloseMult
+holdCloseActive = holdCloseMult > 0 and holdCloseMult < numATRs
+atrPass = minATRPoints <= 0 or rawATR >= minATRPoints * pointSize
+ready = not na(close[length])
+
+if ready and not atrPass
+    strategy.cancel("VltClsLE")
+    strategy.cancel("VltClsSE")
+
+if (ready and strategy.position_size == 0 and atrPass)
+    strategy.entry("VltClsLE", strategy.long, stop=close + atrs, comment="VltClsLE")
+    strategy.entry("VltClsSE", strategy.short, stop=close - atrs, comment="VltClsSE")
+
+if (ready and strategy.position_size > 0)
+    if atrPass
+        strategy.entry("VltClsSE", strategy.short, stop=close - atrs, comment="VltClsSE")
+        if holdCloseActive
+            strategy.exit("VltClsLX", "VltClsLE", stop=close - holdAtrs, comment="Hold Close Long")
+        else
+            strategy.cancel("VltClsLX")
+    else
+        strategy.cancel("VltClsSE")
+        strategy.exit("VltClsLX", "VltClsLE", stop=close - (holdCloseActive ? holdAtrs : atrs), comment="ATR Low Close Long")
+
+if (ready and strategy.position_size < 0)
+    if atrPass
+        strategy.entry("VltClsLE", strategy.long, stop=close + atrs, comment="VltClsLE")
+        if holdCloseActive
+            strategy.exit("VltClsSX", "VltClsSE", stop=close + holdAtrs, comment="Hold Close Short")
+        else
+            strategy.cancel("VltClsSX")
+    else
+        strategy.cancel("VltClsLE")
+        strategy.exit("VltClsSX", "VltClsSE", stop=close + (holdCloseActive ? holdAtrs : atrs), comment="ATR Low Close Short")
+
+plot(close + atrs, "Buy Stop Level", color=color.lime)
+plot(close - atrs, "Sell Stop Level", color=color.red)
+plot(close + holdAtrs, "Short Hold Close Level", color=color.new(color.orange, 30))
+plot(close - holdAtrs, "Long Hold Close Level", color=color.new(color.orange, 30))
+plotchar(rawATR / pointSize, "Raw ATR Points", "", location=location.top, display=display.data_window)
+plotchar(atrPass ? 1 : 0, "ATR Pass", "", location=location.top, display=display.data_window)
+//plot(strategy.equity, title="equity", color=color.red, linewidth=2, style=plot.style_areabr)

@@ -1,0 +1,105 @@
+XAUUSD strategy shortlist
+Updated: 2026-05-20
+
+Use this file as the candidate queue for reruns with trade lists, rolling-window stats,
+session stats, and visual inspection. Current numbers are from the latest result CSVs
+available at the time they were added.
+
+Format:
+strategy | params | result | notes
+
+PSAR, 7d candidates
+1. psar | mode=trend_contrarian; tf=1m; start=0.02; inc=0.02; max=0.1
+   total=$169.91 realised=$172.09 trades=449 wr=61.47% pf=1.251 dd=$117.53
+   Notes: top PSAR PnL, but drawdown is high.
+
+2. psar | mode=trend_contrarian; tf=1m; start=0.02; inc=0.01; max=0.1
+   total=$151.07 realised=$152.64 trades=371 wr=63.88% pf=1.230 dd=$115.51
+   Notes: fewer trades, better win rate than #1.
+
+3. psar | mode=trend_contrarian; tf=1m; start=0.02; inc=0.01; max=0.2
+   total=$146.11 realised=$147.69 trades=387 wr=63.31% pf=1.221 dd=$104.49
+   Notes: same total as max=0.3, slightly better drawdown than top PSAR rows.
+
+4. psar | mode=trend_contrarian; tf=1m; start=0.02; inc=0.04; max=0.1
+   total=$130.27 realised=$131.86 trades=509 wr=62.28% pf=1.204 dd=$94.17
+   Notes: lower PnL, best drawdown among current positive PSAR top rows.
+
+Bollinger, 7d candidates
+1. bbtick | tf=15s; length=34; mult=2; exit=opposite; reverse=1; invert=0
+   total=$283.18 realised=$283.62 trades=467 wr=66.60% pf=1.438 dd=$92.44
+   Notes: highest PnL row. Aggressive because it exits/reverses only on opposite band signal.
+
+2. bbtick | tf=10s; length=34; mult=2.5; exit=opposite; reverse=1; invert=0
+   total=$231.62 realised=$231.82 trades=465 wr=65.16% pf=1.374 dd=$94.00
+   Notes: nearby high-PnL opposite-exit cluster.
+
+3. bbtick | tf=1m; length=55; mult=2.5; exit=basis_trail; reverse=1; invert=0; trail_mult=0.15
+   total=$227.79 realised=$227.79 trades=111 wr=79.28% pf=2.174 dd=$78.40
+   Notes: best clean/risk-adjusted Bollinger row. Arms trail only after basis touch.
+
+4. bbtick | tf=30s; length=55; mult=2.5; exit=basis_trail; reverse=1; invert=0; trail_mult=0.2
+   total=$222.64 realised=$223.41 trades=197 wr=72.59% pf=1.774 dd=$56.77
+   Notes: best practical paper candidate so far: lower DD than top PnL rows, more trades than 1m.
+
+5. bbtick | tf=1m; length=55; mult=2.5; exit=basis_trail; reverse=1; invert=0; trail_mult=0.25
+   total=$223.82 realised=$223.82 trades=109 wr=74.31% pf=2.138 dd=$70.40
+   Notes: close neighbor to #3, confirms basis_trail cluster.
+
+6. bbtick | tf=1m; length=34; mult=2.5; exit=basis_trail; reverse=1; invert=0; trail_mult=0.5
+   total=$218.15 realised=$218.31 trades=152 wr=68.42% pf=1.765 dd=$64.93
+   Notes: shorter length variant, still strong. Useful for robustness checks.
+
+EMA pair, 7d candidates
+1. emapair | tf=1m; fast=6; slow=150; confirm=1; reverse=0; tp=970; sl=400
+   total=$119.94 realised=$119.94 trades=100 wr=39.00% pf=1.487 dd=$41.82
+   Notes: top EMA-pair PnL, lower win rate but decent PF and controlled DD.
+
+2. emapair | tf=30s; fast=4; slow=150; confirm=1; reverse=0; tp=970; sl=750
+   total=$113.94 realised=$113.94 trades=89 wr=51.69% pf=1.354 dd=$57.28
+   Notes: useful 30s variant; wider SL.
+
+3. emapair | tf=1m; fast=4; slow=63; confirm=1; reverse=0; tp=970; sl=750
+   total=$105.10 realised=$105.10 trades=99 wr=50.51% pf=1.293 dd=$84.06
+   Notes: higher DD, but confirms the EMA-pair family is not one isolated row.
+
+4. emapair | tf=3m; fast=4; slow=84; confirm=1; reverse=0; tp=970; sl=0
+   total=$101.48 realised=$92.38 trades=74 wr=43.24% pf=1.448 dd=$39.91
+   Notes: no SL; has open PnL component. Needs trade-list inspection.
+
+5. emapair | tf=3m; fast=4; slow=84; confirm=1; reverse=0; tp=500; sl=0
+   total=$89.39 realised=$89.39 trades=83 wr=62.65% pf=1.562 dd=$33.06
+   Notes: best EMA-pair risk profile in this run, but no SL.
+
+MACD, 7d candidates
+1. macd | tf=2m; mode=candle; dir=invert; fast=12; slow=13; macd_ema=1; deadband=0.1; confirm=1; reverse=0; tp=450; sl=0
+   total=$141.20 realised=$141.20 trades=157 wr=77.71% pf=1.592 dd=$55.72
+   Notes: top MACD row; invert mode matters. No SL, exits by signal/TP.
+
+2. macd | tf=2m; mode=candle; dir=invert; fast=12; slow=13; macd_ema=1; deadband=0.1; confirm=1; reverse=0; tp=500; sl=0
+   total=$137.69 realised=$137.69 trades=157 wr=77.07% pf=1.541 dd=$64.27
+   Notes: close neighbor to #1, slightly worse DD.
+
+3. macd | tf=2m; mode=candle; dir=invert; fast=12; slow=26; macd_ema=1; deadband=0.1; confirm=1; reverse=0; tp=850; sl=800
+   total=$108.94 realised=$108.94 trades=127 wr=65.35% pf=1.342 dd=$42.85
+   Notes: more conventional slow EMA, has SL, better DD than top row.
+
+4. macd | tf=5m; mode=candle; dir=invert; fast=5; slow=13; macd_ema=1; deadband=0.1; confirm=1; reverse=0; tp=950; sl=800
+   total=$101.26 realised=$101.26 trades=91 wr=65.93% pf=1.422 dd=$39.66
+   Notes: lower trade count, decent DD.
+
+5. macd | tf=1m; mode=candle; dir=normal; fast=8; slow=26; macd_ema=1; deadband=0.1; confirm=1; reverse=0; tp=850; sl=500
+   total=$99.34 realised=$96.96 trades=269 wr=35.32% pf=1.211 dd=$65.62
+   Notes: only normal-direction row worth keeping; lower WR, many trades.
+
+Volty, 7d rerun
+- No candidate added. Best row was still negative:
+  volty | tf=1m; mode=normal; length=8; atr_mult=0.95
+  total=$-348.07 realised=$-350.40 trades=1120 wr=34.91% pf=0.901 dd=$434.34
+  Notes: invert mode also stayed negative. Reject Volty for now unless logic changes.
+
+Next validation pass
+1. Rerun each shortlisted param with trade-list output.
+2. Split results by day/session and calculate PnL, PF, win rate, max cumulative DD.
+3. Check whether losses cluster around market open, low-liquidity sessions, or news-like spikes.
+4. Only paper trade params that survive rolling windows, not just full-window PnL.

@@ -1,0 +1,114 @@
+//@version=6
+strategy("MT5-Style MACD TP/SL Strategy", overlay=true, pyramiding=0, calc_on_every_tick=true)
+
+fastLen = input.int(12, "Fast EMA", minval=1)
+slowLen = input.int(26, "Slow EMA", minval=2)
+signalLen = input.int(1, "MACD SMA", minval=1)
+deadband = input.float(0.1, "Deadband", minval=0)
+confirmBars = input.int(1, "Confirm Bars", minval=1)
+
+tpPoints = input.float(800, "Take Profit Points", minval=0)
+slPoints = input.float(0, "Stop Loss Points (0 = MACD exit)", minval=0)
+pointSize = input.float(0.01, "Point Size", minval=0.00001)
+
+reverseOnFlip = input.bool(true, "Reverse On MACD Flip (SL=0 only)")
+reverseOnTP = input.bool(false, "Reverse On Take Profit")
+reverseOnSL = input.bool(false, "Reverse On Stop Loss")
+
+fast = ta.ema(close, fastLen)
+slow = ta.ema(close, slowLen)
+
+// Same model as forex_macd_backtest.py:
+// macd_line = SMA(EMA(fast) - EMA(slow), macd_sma)
+// signalLen=1 means raw EMA(fast)-EMA(slow), i.e. the attached MT5-style line.
+rawMacd = fast - slow
+macdLine = ta.sma(rawMacd, signalLen)
+
+region = macdLine >= deadband ? 1 : macdLine <= -deadband ? -1 : 0
+
+var int longCount = 0
+var int shortCount = 0
+
+if region == 1
+    longCount += 1
+    shortCount := 0
+else if region == -1
+    shortCount += 1
+    longCount := 0
+else
+    longCount := 0
+    shortCount := 0
+
+confirmedRegion = longCount >= confirmBars ? 1 : shortCount >= confirmBars ? -1 : 0
+prevConfirmedRegion = nz(confirmedRegion[1])
+
+longSignal = confirmedRegion == 1 and prevConfirmedRegion != 1
+shortSignal = confirmedRegion == -1 and prevConfirmedRegion != -1
+
+var int lastClosedCount = 0
+var int lastPosSide = 0
+
+if strategy.position_size > 0
+    lastPosSide := 1
+else if strategy.position_size < 0
+    lastPosSide := -1
+
+if strategy.position_size == 0 and longSignal
+    strategy.entry("Long", strategy.long)
+
+if strategy.position_size == 0 and shortSignal
+    strategy.entry("Short", strategy.short)
+
+// If SL is disabled, MACD region owns exits. Optional flip only opens the
+// opposite side when the line has crossed into the opposite region.
+if slPoints == 0 and strategy.position_size > 0 and region <= 0
+    if reverseOnFlip and region == -1
+        strategy.entry("Short", strategy.short, comment="MACD Flip Short")
+    else
+        strategy.close("Long", comment="MACD Exit Long")
+
+if slPoints == 0 and strategy.position_size < 0 and region >= 0
+    if reverseOnFlip and region == 1
+        strategy.entry("Long", strategy.long, comment="MACD Flip Long")
+    else
+        strategy.close("Short", comment="MACD Exit Short")
+
+tpDist = tpPoints * pointSize
+slDist = slPoints * pointSize
+
+if strategy.position_size > 0 and (tpPoints > 0 or slPoints > 0)
+    strategy.exit(
+         "Long TP/SL",
+         "Long",
+         limit=tpPoints > 0 ? strategy.position_avg_price + tpDist : na,
+         stop=slPoints > 0 ? strategy.position_avg_price - slDist : na)
+
+if strategy.position_size < 0 and (tpPoints > 0 or slPoints > 0)
+    strategy.exit(
+         "Short TP/SL",
+         "Short",
+         limit=tpPoints > 0 ? strategy.position_avg_price - tpDist : na,
+         stop=slPoints > 0 ? strategy.position_avg_price + slDist : na)
+
+// Reverse after broker-simulated TP/SL closes only. Uses profit sign to
+// classify TP-like vs SL-like exits.
+if strategy.closedtrades > lastClosedCount and lastPosSide != 0
+    lastTrade = strategy.closedtrades - 1
+    profit = strategy.closedtrades.profit(lastTrade)
+    exitId = strategy.closedtrades.exit_id(lastTrade)
+    isTpSlExit = str.contains(exitId, "TP/SL")
+    doReverse = isTpSlExit and ((reverseOnTP and profit >= 0) or (reverseOnSL and profit < 0))
+    if doReverse
+        if lastPosSide == 1
+            strategy.entry("Short", strategy.short, comment=profit >= 0 ? "TP Reverse Short" : "SL Reverse Short")
+        else
+            strategy.entry("Long", strategy.long, comment=profit >= 0 ? "TP Reverse Long" : "SL Reverse Long")
+    lastClosedCount := strategy.closedtrades
+
+plot(macdLine, "MT5 MACD Line", color=color.aqua)
+hline(0, "Zero", color=color.gray, linestyle=hline.style_dotted)
+hline(deadband, "+Deadband", color=color.new(color.lime, 40), linestyle=hline.style_dotted)
+hline(-deadband, "-Deadband", color=color.new(color.red, 40), linestyle=hline.style_dotted)
+
+plotshape(longSignal, title="MACD Long", style=shape.triangleup, color=color.lime, size=size.tiny, location=location.belowbar, text="L")
+plotshape(shortSignal, title="MACD Short", style=shape.triangledown, color=color.red, size=size.tiny, location=location.abovebar, text="S")
