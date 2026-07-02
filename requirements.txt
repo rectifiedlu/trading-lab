@@ -6,3 +6,7 @@ torch
 scikit-learn
 xgboost
 MetaTrader5
+sympy
+gplearn
+deap
+pysr
