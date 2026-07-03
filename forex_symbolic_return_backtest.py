@@ -289,9 +289,9 @@ def parse_exit_modes(value: str | None, default: list[str]) -> list[str]:
 
 
 def effective_modes(modes: list[str], points: float) -> list[str]:
-    if points > 0:
-        return modes
-    return [m for m in modes if m in {"opposite", "neutral"}] or ["opposite", "neutral"]
+    allowed = {"fixed", "fixed_signal"} if points > 0 else {"opposite", "neutral"}
+    selected = [m for m in modes if m in allowed]
+    return selected or sorted(allowed)
 
 
 def profit_factor(gross_win: float, gross_loss: float) -> float:
@@ -461,6 +461,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
