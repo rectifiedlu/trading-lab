@@ -20,10 +20,10 @@ except Exception:  # pragma: no cover
 
 EXIT_MODES = {"opposite": 0, "neutral": 1, "fixed": 2, "fixed_signal": 3}
 DEFAULT_THRESHOLDS = [20, 40, 60, 100, 150, 200, 300]
-GOLD_TP = [0, 100, 200, 300, 400, 600]
-GOLD_SL = [0, 100, 200, 300, 400, 600]
-FX_TP = [0, 15, 30, 45, 60, 90]
-FX_SL = [0, 15, 30, 45, 60, 90]
+GOLD_TP = [0, 50, 100, 200, 300, 400]
+GOLD_SL = [0, 50, 100, 200, 300, 400]
+FX_TP = [0, 15, 30, 45, 60, 75, 90]
+FX_SL = [0, 15, 30, 45, 60, 75, 90]
 
 
 if njit is not None:
@@ -280,6 +280,12 @@ def default_tp_sl_for_pair(pair: str) -> tuple[list[float], list[float]]:
     return (GOLD_TP, GOLD_SL) if pair.upper().startswith("XAU") else (FX_TP, FX_SL)
 
 
+
+def parse_pair_num_list(value: str | None, default: list[float]) -> list[float]:
+    if value is None or str(value).strip().lower() in {"", "auto", "pair"}:
+        return [float(x) for x in default]
+    return parse_num_list(value, default)
+
 def parse_exit_modes(value: str | None, default: list[str]) -> list[str]:
     modes = parse_str_list(value, default)
     bad = [m for m in modes if m not in EXIT_MODES]
@@ -405,7 +411,7 @@ def main() -> None:
         pair = str(meta["pair"]).upper()
         g = ticks[ticks["pair"].str.upper() == pair].sort_values("timestamp").reset_index(drop=True)
         if g.empty:
-            print(f"[symbt] skip {path.name}: no ticks for {pair}", flush=True)
+            print(f"[symbt] skip {path.name}: no ticks for {pair}; loaded_pairs={sorted(ticks['pair'].str.upper().unique())}", flush=True)
             continue
         bid = g["bid"].to_numpy(np.float64)
         ask = g["ask"].to_numpy(np.float64)
@@ -415,8 +421,9 @@ def main() -> None:
         scores = np.full(len(close), np.nan, dtype=np.float64)
         if np.any(valid):
             scores[valid] = np.asarray(model.predict(x[valid]), dtype=np.float64)
-        tp_values = parse_num_list(args.tp_points, default_tp_sl_for_pair(pair)[0])
-        sl_values = parse_num_list(args.sl_points, default_tp_sl_for_pair(pair)[1])
+        tp_default, sl_default = default_tp_sl_for_pair(pair)
+        tp_values = parse_pair_num_list(args.tp_points, tp_default)
+        sl_values = parse_pair_num_list(args.sl_points, sl_default)
         model_rows = 0
         combo_total = 0
         for _tp in tp_values:
@@ -461,6 +468,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
