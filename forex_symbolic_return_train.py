@@ -1,4 +1,4 @@
-﻿"""Train symbolic future-return formulas from raw lagged OHLC.
+"""Train symbolic future-return formulas from raw lagged OHLC.
 
 Artifact scope is one pair/session/timeframe/window/horizon. Inputs are raw
 OHLC lags only: o0,h0,l0,c0,o1,h1,l1,c1,... Target is future close return
@@ -25,8 +25,10 @@ except Exception:  # pragma: no cover
 
 DEFAULT_TIMEFRAMES = ["1m", "3m", "5m"]
 DEFAULT_SESSIONS = [-1, 0, 1, 2]
-DEFAULT_WINDOWS = [8, 16, 32]
-DEFAULT_HORIZONS = [5, 10, 20]
+DEFAULT_WINDOWS = [64]
+DEFAULT_HORIZONS = [3]
+DEFAULT_PYSR_BINARY_OPERATORS = ["+", "-", "*", "/", "max", "min"]
+DEFAULT_PYSR_UNARY_OPERATORS = ["abs", "square", "cube", "sqrt", "log", "exp", "tanh"]
 
 
 def safe_name(value: str) -> str:
@@ -113,14 +115,15 @@ def fit_gplearn(args, x_train: np.ndarray, y_train: np.ndarray, names: list[str]
 
 
 def fit_pysr(args, x_train: np.ndarray, y_train: np.ndarray, names: list[str]):
+    os.environ.setdefault("JULIA_DEPOT_PATH", str((Path(args.out_dir) / ".julia").resolve()))
     from pysr import PySRRegressor
 
     model = PySRRegressor(
         niterations=args.generations,
         populations=max(1, args.population // 100),
         population_size=min(max(args.population, 20), 200),
-        binary_operators=["+", "-", "*", "/"],
-        unary_operators=[],
+        binary_operators=parse_str_list(args.pysr_binary_operators, DEFAULT_PYSR_BINARY_OPERATORS),
+        unary_operators=parse_str_list(args.pysr_unary_operators, DEFAULT_PYSR_UNARY_OPERATORS),
         model_selection="best",
         maxsize=args.maxsize,
         random_state=args.seed,
@@ -159,19 +162,38 @@ def split_stats(model, x: np.ndarray, y: np.ndarray) -> dict:
     return {"n": int(len(y)), "mae": float(np.mean(np.abs(err))), "rmse": float(np.sqrt(np.mean(err * err))), "corr": corr}
 
 
+def rank_corr(meta: dict) -> float:
+    """Use held-out correlation whenever the model has a held-out split."""
+    test = meta.get("test", {})
+    train = meta.get("train", {})
+    value = test.get("corr") if test.get("n", 0) else train.get("corr")
+    return float(value) if value is not None and np.isfinite(value) else float("-inf")
+
+
+def print_ranked_summary(summary: list[dict], top: int = 30) -> None:
+    print("[symtrain] ranked by test corr; train corr when test split is empty", flush=True)
+    for rank, meta in enumerate(summary[:top], 1):
+        source = "test" if meta["test"].get("n", 0) else "train"
+        print(
+            f"[symtrain] rank={rank} corr={rank_corr(meta):.6f} source={source} "
+            f"pair={meta['pair']} tf={meta['timeframe']} sess={meta['session']} "
+            f"w={meta['window']} h={meta['horizon']} expr={meta['expression']}",
+            flush=True,
+        )
+
 def main() -> None:
     ap = build_parser("Symbolic raw-OHLC future-return trainer", "unused.csv")
     ap.add_argument("--sessions", default=",".join(str(x) for x in DEFAULT_SESSIONS))
     ap.add_argument("--windows", default=",".join(str(x) for x in DEFAULT_WINDOWS))
     ap.add_argument("--horizons", default=",".join(str(x) for x in DEFAULT_HORIZONS))
-    ap.add_argument("--backend", choices=["gplearn", "pysr"], default="gplearn")
+    ap.add_argument("--backend", choices=["gplearn", "pysr"], default="pysr")
     ap.add_argument("--out-dir", default=os.path.join("data", "forex", "symbolic_models"))
     ap.add_argument("--train-frac", type=float, default=0.70)
     ap.add_argument("--train-only", action="store_true", help="fit on all available samples; no held-out test split")
     ap.add_argument("--max-samples", type=int, default=50000)
     ap.add_argument("--min-samples", type=int, default=1000)
     ap.add_argument("--population", type=int, default=1200)
-    ap.add_argument("--generations", type=int, default=20)
+    ap.add_argument("--generations", type=int, default=40)
     ap.add_argument("--tournament-size", type=int, default=20)
     ap.add_argument("--stopping-criteria", type=float, default=0.0)
     ap.add_argument("--const-range", type=float, default=10.0)
@@ -180,7 +202,9 @@ def main() -> None:
     ap.add_argument("--metric", choices=["mean absolute error", "mse", "rmse", "pearson", "spearman"], default="mean absolute error")
     ap.add_argument("--parsimony", type=float, default=0.001)
     ap.add_argument("--fit-sample-fraction", type=float, default=0.80)
-    ap.add_argument("--maxsize", type=int, default=30, help="PySR max expression size")
+    ap.add_argument("--maxsize", type=int, default=48, help="PySR max expression size")
+    ap.add_argument("--pysr-binary-operators", default=",".join(DEFAULT_PYSR_BINARY_OPERATORS))
+    ap.add_argument("--pysr-unary-operators", default=",".join(DEFAULT_PYSR_UNARY_OPERATORS))
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--jobs", type=int, default=1)
     ap.add_argument("--verbose", action="store_true")
@@ -263,9 +287,14 @@ def main() -> None:
                         print(f"[symtrain] fit done {progress_text(done_jobs, total_jobs, t0)} trained={trained_jobs:,} skipped={skipped_jobs:,} fit={fmt_elapsed(time.time() - fit_start)} test_mae={test_stats['mae']} test_corr={test_stats['corr']} expr={expr}", flush=True)
                         print(f"[symtrain] wrote {meta_path}", flush=True)
 
+    summary.sort(key=rank_corr, reverse=True)
+    for meta in summary:
+        meta["rank_corr"] = rank_corr(meta)
+        meta["rank_source"] = "test" if meta["test"].get("n", 0) else "train"
     summary_path = Path(args.out_dir) / "symbolic_training_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
+    print_ranked_summary(summary)
     print(f"[symtrain] done {progress_text(done_jobs, total_jobs, t0)} models={len(summary):,} trained={trained_jobs:,} skipped={skipped_jobs:,} summary={summary_path}", flush=True)
 
 
