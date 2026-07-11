@@ -87,6 +87,15 @@ def build_lagged(open_, high, low, close, valid, window: int, horizon: int, poin
     return np.asarray(rows, dtype=np.float64), np.asarray(targets, dtype=np.float64)
 
 
+def _sympy_sqrtabs(x):
+    import sympy
+    return sympy.sqrt(sympy.Abs(x))
+
+
+def _sympy_logabs(x):
+    import sympy
+    return sympy.log(1 + sympy.Abs(x))
+
 def fit_gplearn(args, x_train: np.ndarray, y_train: np.ndarray, names: list[str]):
     from gplearn.genetic import SymbolicRegressor
 
@@ -128,7 +137,8 @@ def fit_pysr(args, x_train: np.ndarray, y_train: np.ndarray, names: list[str]):
         maxsize=args.maxsize,
         parallelism="multiprocessing",
         procs=max(1, args.pysr_workers),
-        random_state=args.seed,
+        extra_sympy_mappings={"sqrtabs": _sympy_sqrtabs, "logabs": _sympy_logabs},
+        random_state=args.seed if args.pysr_workers <= 1 else None,
         progress=bool(args.verbose),
         verbosity=1 if args.verbose else 0,
     )

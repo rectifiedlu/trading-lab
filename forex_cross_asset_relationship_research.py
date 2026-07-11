@@ -24,6 +24,15 @@ PYSR_BINARY_OPERATORS = ["+", "-", "*", "/", "^", "max", "min"]
 PYSR_UNARY_OPERATORS = ["abs", "sign", "square", "cube", "sqrtabs(x) = sqrt(abs(x))", "logabs(x) = log1p(abs(x))", "tanh", "atan", "sin", "cos"]
 
 
+def _sympy_sqrtabs(x):
+    import sympy
+    return sympy.sqrt(sympy.Abs(x))
+
+
+def _sympy_logabs(x):
+    import sympy
+    return sympy.log(1 + sympy.Abs(x))
+
 def canonical_candles(group: pd.DataFrame, timeframe: str, prefix: str) -> pd.DataFrame:
     bid = group.bid.to_numpy(np.float64)
     ts_ns = group.timestamp.to_numpy(dtype="datetime64[ns]").astype("int64")
@@ -139,7 +148,8 @@ def symbolic_rows(frame: pd.DataFrame, timeframe: str, generations: int, populat
                     population_size=min(max((population + pysr_workers - 1) // pysr_workers, 20), 200), binary_operators=binary_operators,
                     unary_operators=unary_operators, model_selection="best", maxsize=maxsize,
                     parallelism="multiprocessing", procs=max(1, pysr_workers),
-                    random_state=seed, progress=False, verbosity=0,
+                    extra_sympy_mappings={"sqrtabs": _sympy_sqrtabs, "logabs": _sympy_logabs},
+                    random_state=seed if pysr_workers <= 1 else None, progress=False, verbosity=0,
                 )
                 model.fit(x[:split], y[:split], variable_names=names)
                 expression = str(model.equations_.iloc[-1]["equation"])
