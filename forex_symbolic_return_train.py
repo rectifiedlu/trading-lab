@@ -27,8 +27,8 @@ DEFAULT_TIMEFRAMES = ["1m", "3m", "5m"]
 DEFAULT_SESSIONS = [-1, 0, 1, 2]
 DEFAULT_WINDOWS = [64]
 DEFAULT_HORIZONS = [3]
-DEFAULT_PYSR_BINARY_OPERATORS = ["+", "-", "*", "/", "max", "min"]
-DEFAULT_PYSR_UNARY_OPERATORS = ["abs", "square", "cube", "sqrt", "log", "exp", "tanh"]
+DEFAULT_PYSR_BINARY_OPERATORS = ["+", "-", "*", "/", "^", "max", "min"]
+DEFAULT_PYSR_UNARY_OPERATORS = ["abs", "sign", "square", "cube", "sqrtabs(x) = sqrt(abs(x))", "logabs(x) = log1p(abs(x))", "tanh", "atan", "sin", "cos"]
 
 
 def safe_name(value: str) -> str:
@@ -120,18 +120,22 @@ def fit_pysr(args, x_train: np.ndarray, y_train: np.ndarray, names: list[str]):
 
     model = PySRRegressor(
         niterations=args.generations,
-        populations=max(1, args.population // 100),
-        population_size=min(max(args.population, 20), 200),
+        populations=max(1, args.pysr_workers),
+        population_size=min(max((args.population + args.pysr_workers - 1) // args.pysr_workers, 20), 200),
         binary_operators=parse_str_list(args.pysr_binary_operators, DEFAULT_PYSR_BINARY_OPERATORS),
         unary_operators=parse_str_list(args.pysr_unary_operators, DEFAULT_PYSR_UNARY_OPERATORS),
         model_selection="best",
         maxsize=args.maxsize,
+        parallelism="multiprocessing",
+        procs=max(1, args.pysr_workers),
         random_state=args.seed,
         progress=bool(args.verbose),
         verbosity=1 if args.verbose else 0,
     )
     model.fit(x_train, y_train, variable_names=names)
-    return model, str(model.sympy())
+    # Native text avoids SymPy recursion for deeply nested piecewise expressions.
+    equation = model.equations_.iloc[-1]["equation"] if getattr(model, "equations_", None) is not None else "<unavailable>"
+    return model, str(equation)
 
 
 def fmt_elapsed(seconds: float) -> str:
@@ -205,8 +209,9 @@ def main() -> None:
     ap.add_argument("--maxsize", type=int, default=48, help="PySR max expression size")
     ap.add_argument("--pysr-binary-operators", default=",".join(DEFAULT_PYSR_BINARY_OPERATORS))
     ap.add_argument("--pysr-unary-operators", default=",".join(DEFAULT_PYSR_UNARY_OPERATORS))
+    ap.add_argument("--pysr-workers", type=int, default=15, help="Julia worker processes per PySR fit")
     ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--jobs", type=int, default=1)
+    ap.add_argument("--jobs", type=int, default=15, help="gplearn worker processes; PySR uses --pysr-workers")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -222,7 +227,7 @@ def main() -> None:
     done_jobs = 0
     trained_jobs = 0
     skipped_jobs = 0
-    print(f"[symtrain] plan pairs={ticks['pair'].nunique()} timeframes={timeframes} sessions={sessions} windows={windows} horizons={horizons} total={total_jobs:,} backend={args.backend} train_only={int(args.train_only)}", flush=True)
+    print(f"[symtrain] plan pairs={ticks['pair'].nunique()} timeframes={timeframes} sessions={sessions} windows={windows} horizons={horizons} total={total_jobs:,} backend={args.backend} pysr_workers={args.pysr_workers} train_only={int(args.train_only)}", flush=True)
 
     for pair, g in ticks.groupby("pair", sort=False):
         g = g.sort_values("timestamp").reset_index(drop=True)

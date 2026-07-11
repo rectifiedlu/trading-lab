@@ -20,8 +20,8 @@ from forex_strategy_common import build_parser, load_market, timeframe_to_ns
 LOOKBACKS = (1, 3, 6, 12)
 HORIZONS = (1, 3, 6, 12)
 LAGS = (0, 1, 2, 3, 6, 12)
-PYSR_BINARY_OPERATORS = ["+", "-", "*", "/", "max", "min"]
-PYSR_UNARY_OPERATORS = ["abs", "square", "cube", "sqrt", "log", "exp", "tanh"]
+PYSR_BINARY_OPERATORS = ["+", "-", "*", "/", "^", "max", "min"]
+PYSR_UNARY_OPERATORS = ["abs", "sign", "square", "cube", "sqrtabs(x) = sqrt(abs(x))", "logabs(x) = log1p(abs(x))", "tanh", "atan", "sin", "cos"]
 
 
 def canonical_candles(group: pd.DataFrame, timeframe: str, prefix: str) -> pd.DataFrame:
@@ -60,7 +60,7 @@ def corr_stats(x: np.ndarray, y: np.ndarray) -> tuple[float, float, int]:
 def pure_rows(frame: pd.DataFrame, timeframe: str) -> list[dict]:
     rows = []
     thirds = np.array_split(np.arange(len(frame)), 3)
-    for leader, follower in (("xau", "aud"), ("aud", "xau")):
+    for leader, follower in (("xau", "aud"), ("aud", "xau"), ("xaua", "aud"), ("aud", "xaua")):
         for lookback in LOOKBACKS:
             x = bps_return(frame[f"{leader}_close"].to_numpy(), lookback)
             for horizon in HORIZONS:
@@ -92,7 +92,7 @@ def pure_rows(frame: pd.DataFrame, timeframe: str) -> list[dict]:
 
 def symbolic_rows(frame: pd.DataFrame, timeframe: str, generations: int, population: int, seed: int,
                   backend: str, binary_operators: list[str], unary_operators: list[str], maxsize: int,
-                  depot_dir: str) -> list[dict]:
+                  pysr_workers: int, depot_dir: str) -> list[dict]:
     if backend == "gplearn":
         from gplearn.genetic import SymbolicRegressor
     else:
@@ -102,7 +102,7 @@ def symbolic_rows(frame: pd.DataFrame, timeframe: str, generations: int, populat
     rows = []
     base = {}
     names = []
-    for pair in ("aud", "xau"):
+    for pair in ("aud", "xau", "xaua"):
         close = frame[f"{pair}_close"].to_numpy()
         for lag in range(6):
             value = np.full(len(close), np.nan)
@@ -114,7 +114,7 @@ def symbolic_rows(frame: pd.DataFrame, timeframe: str, generations: int, populat
             base[name] = value
             names.append(name)
     x_all = np.column_stack([base[name] for name in names])
-    for target_pair in ("aud", "xau"):
+    for target_pair in ("aud", "xau", "xaua"):
         close = frame[f"{target_pair}_close"].to_numpy()
         for horizon in (1, 3, 6):
             y_all = future_bps(close, horizon)
@@ -135,13 +135,14 @@ def symbolic_rows(frame: pd.DataFrame, timeframe: str, generations: int, populat
                 expression = str(model._program)
             else:
                 model = PySRRegressor(
-                    niterations=generations, populations=max(1, population // 100),
-                    population_size=min(max(population, 20), 200), binary_operators=binary_operators,
+                    niterations=generations, populations=max(1, pysr_workers),
+                    population_size=min(max((population + pysr_workers - 1) // pysr_workers, 20), 200), binary_operators=binary_operators,
                     unary_operators=unary_operators, model_selection="best", maxsize=maxsize,
+                    parallelism="multiprocessing", procs=max(1, pysr_workers),
                     random_state=seed, progress=False, verbosity=0,
                 )
                 model.fit(x[:split], y[:split], variable_names=names)
-                expression = str(model.sympy())
+                expression = str(model.equations_.iloc[-1]["equation"])
             pred = np.asarray(model.predict(x[split:]), dtype=np.float64)
             actual = y[split:]
             corr, hit, _ = corr_stats(pred, actual)
@@ -165,7 +166,9 @@ def main() -> None:
     ap.add_argument("--maxsize", type=int, default=48)
     ap.add_argument("--pysr-binary-operators", default=",".join(PYSR_BINARY_OPERATORS))
     ap.add_argument("--pysr-unary-operators", default=",".join(PYSR_UNARY_OPERATORS))
+    ap.add_argument("--pysr-workers", type=int, default=15)
     ap.add_argument("--seed", type=int, default=47)
+    ap.add_argument("--skip-symbolic", action="store_true", help="run pure lead/lag analysis only")
     args = ap.parse_args()
     args.timeframes = args.timeframes or "5m,15m"
     args.pairs = ["AUDUSD", "XAUUSD"]
@@ -178,14 +181,17 @@ def main() -> None:
         aud = canonical_candles(groups["AUDUSD"], timeframe, "aud")
         xau = canonical_candles(groups["XAUUSD"], timeframe, "xau")
         frame = aud.merge(xau, on="timestamp", how="inner")
+        # Gold priced in Australian dollars removes the shared USD denomination.
+        frame["xaua_close"] = frame["xau_close"] / frame["aud_close"]
         print(f"[cross] tf={timeframe} aligned_candles={len(frame):,}", flush=True)
         rows.extend(pure_rows(frame, timeframe))
-        rows.extend(symbolic_rows(
-            frame, timeframe, args.generations, args.population, args.seed, args.backend,
-            [x.strip() for x in args.pysr_binary_operators.split(",") if x.strip()],
-            [x.strip() for x in args.pysr_unary_operators.split(",") if x.strip()], args.maxsize,
-            os.path.abspath(os.path.join(os.path.dirname(args.out) or ".", ".julia")),
-        ))
+        if not args.skip_symbolic:
+            rows.extend(symbolic_rows(
+                frame, timeframe, args.generations, args.population, args.seed, args.backend,
+                [x.strip() for x in args.pysr_binary_operators.split(",") if x.strip()],
+                [x.strip() for x in args.pysr_unary_operators.split(",") if x.strip()], args.maxsize, args.pysr_workers,
+                os.path.abspath(os.path.join(os.path.dirname(args.out) or ".", ".julia")),
+            ))
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", newline="", encoding="utf-8") as f:
         fields = sorted({key for row in rows for key in row})
