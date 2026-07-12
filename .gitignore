@@ -31,3 +31,5 @@ experiments/
 *.tmp
 *_smoke.csv
 *_results.csv
+
+trafficproject/
