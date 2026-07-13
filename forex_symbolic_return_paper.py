@@ -105,6 +105,17 @@ def close_fixed_if_needed(mt5, args) -> bool:
     return False
 
 
+
+def position_text(mt5, args, pos) -> str:
+    if pos is None:
+        return "flat"
+    move = current_move_points(mt5, args, pos)
+    side = "LONG" if int(pos.type) == mt5.POSITION_TYPE_BUY else "SHORT"
+    return (
+        f"{side} ticket={int(pos.ticket)} entry={float(pos.price_open):.5f} "
+        f"move={move if move is not None else float('nan'):+.1f}pt"
+    )
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="MT5 paper trader for symbolic future-return models")
     ap.add_argument("--model", required=True, help="symbolic artifact JSON produced by forex_symbolic_return_train.py")
@@ -145,11 +156,20 @@ def main() -> None:
 
     last_log = 0.0
     last_bar = 0
+    last_score: float | None = None
+    last_signal = 0
+    last_session_ok: bool | None = None
     print(
         f"[{TAG}-paper] start symbol={args.symbol} tf={args.timeframe} window={window} "
         f"horizon={meta['horizon']} session={meta['session']} threshold={args.threshold:g} mode={args.mode} "
         f"tp={args.tp_mode}:{args.tp_points:g} sl={args.sl_mode}:{args.sl_points:g} "
         f"model={model_path.name} dry={int(args.dry_run)}",
+        flush=True,
+    )
+    print(
+        f"[{TAG}-paper] model_meta target={meta.get('target', '?')} backend={meta.get('backend', '?')} "
+        f"train_corr={float(meta.get('train', {}).get('corr') or float('nan')):.4f} "
+        f"train_n={meta.get('train', {}).get('n', '?')} point={float(meta.get('point_size') or default_point_size(args.symbol)):g}",
         flush=True,
     )
 
@@ -167,11 +187,16 @@ def main() -> None:
                 score = score_closed_candles(model, candles, window)
                 signal = signal_from_score(score, args.threshold, args.mode)
                 session_ok = entry_allowed(meta, last_bar, candles.tf_sec)
+                last_score = score
+                last_signal = signal
+                last_session_ok = session_ok
                 pos = find_position(mt5, args.symbol, args.magic)
+                candle = candles.closed[-1]
                 signal_text = "LONG" if signal == 1 else ("SHORT" if signal == -1 else "NEUTRAL")
                 print(
-                    f"[{TAG}-paper] bar={last_bar} score={score if score is not None else float('nan'):+.3f} "
-                    f"signal={signal_text} session_ok={int(session_ok)}",
+                    f"[{TAG}-paper] BAR bucket={last_bar} O={candle.open:.5f} H={candle.high:.5f} L={candle.low:.5f} C={candle.close:.5f} | "
+                    f"score={score if score is not None else float('nan'):+.3f} threshold=+/-{args.threshold:g} signal={signal_text} "
+                    f"mode={args.mode} session={meta['session']} entry_ok={int(session_ok)} pos={position_text(mt5, args, pos)}",
                     flush=True,
                 )
 
@@ -201,8 +226,14 @@ def main() -> None:
                     move = current_move_points(mt5, args, pos)
                     side = "L" if int(pos.type) == mt5.POSITION_TYPE_BUY else "S"
                     pos_text = f"{side} entry={float(pos.price_open):.5f} move={move if move is not None else float('nan'):+.1f}pt"
+                signal_text = "LONG" if last_signal == 1 else ("SHORT" if last_signal == -1 else "NEUTRAL")
+                model_text = (
+                    f"score={last_score:+.3f} signal={signal_text} session_ok={int(last_session_ok)}"
+                    if last_score is not None and last_session_ok is not None
+                    else "score=waiting signal=NEUTRAL session_ok=?"
+                )
                 print(
-                    f"[{TAG}-paper] tick={float(tick.bid):.5f}/{float(tick.ask):.5f} pos={pos_text}",
+                    f"[{TAG}-paper] tick={float(tick.bid):.5f}/{float(tick.ask):.5f} pos={pos_text} | {model_text}",
                     flush=True,
                 )
             time.sleep(args.poll)
