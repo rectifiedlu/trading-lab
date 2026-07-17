@@ -90,6 +90,8 @@ if njit is not None:
         candle_i = 0
         tick_floor = 0
         pending_side = 0
+        block_long = False
+        block_short = False
 
         while candle_i < len(close_idx):
             if pending_side != 0:
@@ -99,9 +101,25 @@ if njit is not None:
                 if entry_tick >= len(bid):
                     break
                 candle_i = int(tick_to_candle[entry_tick])
+                if side == 1 and block_long:
+                    candle_i += 1
+                    continue
+                if side == -1 and block_short:
+                    candle_i += 1
+                    continue
             else:
                 side = _sig(scores[candle_i], threshold, invert)
+                if block_long and side != 1:
+                    block_long = False
+                if block_short and side != -1:
+                    block_short = False
                 if side == 0 or side_filter_code == -side or not entry_allowed[candle_i]:
+                    candle_i += 1
+                    continue
+                if side == 1 and block_long:
+                    candle_i += 1
+                    continue
+                if side == -1 and block_short:
                     candle_i += 1
                     continue
                 entry_tick = int(close_idx[candle_i]) + 1
@@ -208,6 +226,11 @@ if njit is not None:
                 stops += 1
             elif reason == 1:
                 sig_exits += 1
+            if reason == 2 or reason == 3:
+                if side == 1:
+                    block_long = True
+                else:
+                    block_short = True
             if full_trade_pnl >= 0.0:
                 wins += 1
                 gross_win += full_trade_pnl
