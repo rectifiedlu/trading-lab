@@ -1,4 +1,4 @@
-﻿"""Backtest symbolic future-return formulas with threshold and TP/SL sweeps."""
+"""Backtest symbolic future-return formulas with threshold and TP/SL sweeps."""
 from __future__ import annotations
 
 import csv
@@ -346,25 +346,21 @@ def load_artifact(meta_path: Path):
     return meta, model
 
 
-def simulate_one(pair, meta, bid, ask, ts_ns, close_idx, scores, threshold, mode_name, tp_mode, sl_mode, tp, sl, args) -> TradeResult:
-    point = float(meta.get("point_size") or default_point_size(pair))
-    candle_ts = ts_ns[close_idx]
-    entry_allowed = active_session_allowed(candle_ts, int(meta["session"]))
-    tick_to_candle = build_tick_to_candle(len(bid), close_idx)
-    did, max_days = day_ids(ts_ns)
+def simulate_one(pair, meta, bid, ask, close_idx, scores, entry_allowed, tick_to_candle, did, max_days, point, threshold, mode_name, tp_mode, sl_mode, tp, sl, args) -> TradeResult:
     side_code = 0 if args.side == "both" else (1 if args.side == "long" else -1)
     out = _simulate(
-        bid, ask, close_idx.astype(np.int64), tick_to_candle, scores.astype(np.float64), entry_allowed.astype(np.bool_),
-        did.astype(np.int64), int(max_days), float(threshold), 1 if mode_name == "invert" else 0,
+        bid, ask, close_idx.astype(np.int64), tick_to_candle, scores.astype(np.float64), entry_allowed,
+        did, int(max_days), float(threshold), 1 if mode_name == "invert" else 0,
         EXIT_MODES[tp_mode], EXIT_MODES[sl_mode], float(tp), float(sl), point,
         args.amount, bool(args.compound), args.leverage, args.commission_per_million, side_code,
     )
     realised, open_u, trades, wins, losses, gw, gl, max_dd, cum_dd, longs, shorts, stops, sig, worst, tr_max, daily, pnls = out
+    expr_part = f"expr={meta.get('expression', '')};" if getattr(args, "include_expression", False) else ""
     r = TradeResult(
         pair=pair, strategy="symbolic_return",
-        params=(f"expr={meta.get('expression','')};threshold={threshold:g};mode={mode_name};tp_mode={tp_mode};"
+        params=(f"{expr_part}threshold={threshold:g};mode={mode_name};tp_mode={tp_mode};"
                 f"sl_mode={sl_mode};session={meta['session']};window={meta['window']};horizon={meta['horizon']};"
-                f"backend={meta.get('backend','')};file={Path(meta.get('model_path','')).name}"),
+                f"backend={meta.get('backend','')};file={Path(meta.get('model_path', '')).name}"),
         timeframe=str(meta["timeframe"]), tp_points=float(tp), sl_points=float(sl), point_size=point,
         realised=float(realised), open_unrealized=float(open_u), total=float(realised + open_u), trades=int(trades),
         wins=int(wins), losses=int(losses), win_rate=float(wins / trades * 100.0 if trades else 0.0),
@@ -386,19 +382,37 @@ def simulate_one(pair, meta, bid, ask, ts_ns, close_idx, scores, threshold, mode
     return r
 
 
+SYMBOLIC_FIELDS = ["pair", "strategy", "timeframe", "threshold", "mode", "tp_mode", "tp_points", "sl_mode", "sl_points",
+                   "realised", "open_unrealized", "total", "trades", "win_rate", "profit_factor", "max_drawdown",
+                   "cum_max_drawdown", "trade_max_drawdown", "worst_trade_pnl", "avg_day", "median_day", "long_trades",
+                   "short_trades", "stop_losses", "signal_exits", "eval_session", "window", "horizon", "backend", "model_file", "params"]
+
+
+def symbolic_row(r: TradeResult) -> list[object]:
+    return [getattr(r, field, "") for field in SYMBOLIC_FIELDS]
+
+
 def write_symbolic_csv(path: str, rows: list[TradeResult]) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     rows.sort(key=lambda r: (r.total, r.profit_factor, -r.max_drawdown), reverse=True)
-    fields = ["pair", "strategy", "timeframe", "threshold", "mode", "tp_mode", "tp_points", "sl_mode", "sl_points",
-              "realised", "open_unrealized", "total", "trades", "win_rate", "profit_factor", "max_drawdown",
-              "cum_max_drawdown", "trade_max_drawdown", "worst_trade_pnl", "avg_day", "median_day", "long_trades",
-              "short_trades", "stop_losses", "signal_exits", "eval_session", "window", "horizon", "backend", "model_file", "params"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(fields)
+        w.writerow(SYMBOLIC_FIELDS)
         for r in rows:
-            w.writerow([getattr(r, field, "") for field in fields])
+            w.writerow(symbolic_row(r))
 
+
+def append_symbolic_csv(path: str, rows: list[TradeResult]) -> None:
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    exists = os.path.exists(path) and os.path.getsize(path) > 0
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if not exists:
+            w.writerow(SYMBOLIC_FIELDS)
+        for r in rows:
+            w.writerow(symbolic_row(r))
 
 def main() -> None:
     ap = build_parser("Symbolic future-return formula backtest", "forex_symbolic_return_results.csv")
@@ -408,21 +422,67 @@ def main() -> None:
     ap.add_argument("--modes", default="normal,invert")
     ap.add_argument("--tp-modes", default="fixed,fixed_signal,opposite,neutral")
     ap.add_argument("--sl-modes", default="fixed,fixed_signal,opposite,neutral")
+    ap.add_argument("--include-expression", action="store_true", help="repeat full symbolic expression in every result row; off by default to avoid huge memory/CSV bloat")
+    ap.add_argument("--keep-in-memory", action="store_true", help="keep all rows in RAM for sorted final console output; off by default for long sweeps")
     args = ap.parse_args()
 
-    paths = sorted(Path(args.model_dir).glob(args.model_glob))
-    if not paths:
-        raise SystemExit(f"no model json files found: {args.model_dir}/{args.model_glob}")
     ticks, _ = load_market(args)
+    requested_pairs = {str(p).upper() for p in args.pairs}
+    requested_timeframes = None if not args.timeframes else {str(tf).strip().lower() for tf in parse_str_list(args.timeframes, [])}
+    all_paths = sorted(Path(args.model_dir).glob(args.model_glob))
+    if not all_paths:
+        raise SystemExit(f"no model json files found: {args.model_dir}/{args.model_glob}")
+    paths = []
+    skipped_meta = 0
+    for path in all_paths:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                meta_probe = json.load(f)
+            if not isinstance(meta_probe, dict) or "pair" not in meta_probe or "model_path" not in meta_probe:
+                skipped_meta += 1
+                continue
+            pair_ok = str(meta_probe["pair"]).upper() in requested_pairs
+            tf_ok = requested_timeframes is None or str(meta_probe.get("timeframe", "")).strip().lower() in requested_timeframes
+            if pair_ok and tf_ok:
+                paths.append(path)
+        except Exception:
+            skipped_meta += 1
+    if not paths:
+        tf_msg = "all" if requested_timeframes is None else sorted(requested_timeframes)
+        raise SystemExit(f"no usable model json files for pairs={sorted(requested_pairs)} timeframes={tf_msg} in {args.model_dir}/{args.model_glob}")
+    if skipped_meta:
+        print(f"[symbt] skipped non-model/bad json files={skipped_meta:,}", flush=True)
+    model_counts: dict[str, int] = {}
+    model_tf_counts: dict[str, int] = {}
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as f:
+            meta_count = json.load(f)
+        pair_name = str(meta_count.get("pair", "")).upper()
+        tf_name = str(meta_count.get("timeframe", "")).strip().lower()
+        model_counts[pair_name] = model_counts.get(pair_name, 0) + 1
+        key = f"{pair_name}:{tf_name}"
+        model_tf_counts[key] = model_tf_counts.get(key, 0) + 1
+    loaded_pairs = sorted(ticks["pair"].str.upper().unique())
+    print(
+        f"[symbt] requested_pairs={sorted(requested_pairs)} loaded_pairs={loaded_pairs} "
+        f"timeframes={'all' if requested_timeframes is None else sorted(requested_timeframes)} "
+        f"models_by_pair={model_counts} models_by_pair_tf={model_tf_counts}",
+        flush=True,
+    )
     thresholds = parse_num_list(args.thresholds, DEFAULT_THRESHOLDS)
     modes = parse_str_list(args.modes, ["normal", "invert"])
     tp_modes = parse_exit_modes(args.tp_modes, ["fixed", "fixed_signal", "opposite", "neutral"])
     sl_modes = parse_exit_modes(args.sl_modes, ["fixed", "fixed_signal", "opposite", "neutral"])
     results: list[TradeResult] = []
+    total_rows = 0
     t0 = time.time()
+    checkpoint_out = args.out + ".checkpoint.csv"
     if os.path.exists(args.out):
         os.remove(args.out)
         print(f"[symbt] overwrite out={args.out}", flush=True)
+    if os.path.exists(checkpoint_out):
+        os.remove(checkpoint_out)
+        print(f"[symbt] overwrite checkpoint={checkpoint_out}", flush=True)
     print(
         f"[symbt] plan models={len(paths):,} thresholds={thresholds} modes={modes} "
         f"tp_modes={tp_modes} sl_modes={sl_modes} out={args.out}",
@@ -444,10 +504,22 @@ def main() -> None:
         scores = np.full(len(close), np.nan, dtype=np.float64)
         if np.any(valid):
             scores[valid] = np.asarray(model.predict(x[valid]), dtype=np.float64)
+        point = float(meta.get("point_size") or default_point_size(pair))
+        candle_ts = ts_ns[close_idx]
+        entry_allowed = active_session_allowed(candle_ts, int(meta["session"])).astype(np.bool_)
+        tick_to_candle = build_tick_to_candle(len(bid), close_idx).astype(np.int64)
+        did, max_days = day_ids(ts_ns)
+        did = did.astype(np.int64)
+        print(
+            f"[symbt] model prep {n:,}/{len(paths):,} {path.name} "
+            f"tf={meta['timeframe']} candles={len(close):,} ticks={len(g):,} valid={int(np.sum(valid)):,}",
+            flush=True,
+        )
         tp_default, sl_default = default_tp_sl_for_pair(pair)
         tp_values = parse_pair_num_list(args.tp_points, tp_default)
         sl_values = parse_pair_num_list(args.sl_points, sl_default)
         model_rows = 0
+        pending_checkpoint_rows: list[TradeResult] = []
         combo_total = 0
         for _tp in tp_values:
             for _sl in sl_values:
@@ -468,32 +540,39 @@ def main() -> None:
                     for sl in sl_values:
                         for tp_mode in effective_modes(tp_modes, float(tp)):
                             for sl_mode in effective_modes(sl_modes, float(sl)):
-                                r = simulate_one(pair, meta, bid, ask, ts_ns, close_idx, scores, threshold, mode_name, tp_mode, sl_mode, tp, sl, args)
+                                r = simulate_one(pair, meta, bid, ask, close_idx, scores, entry_allowed, tick_to_candle, did, max_days, point, threshold, mode_name, tp_mode, sl_mode, tp, sl, args)
                                 if r.trades >= args.min_trades:
-                                    results.append(r)
+                                    if args.keep_in_memory:
+                                        results.append(r)
+                                    pending_checkpoint_rows.append(r)
                                     model_rows += 1
+                                    total_rows += 1
                                 combo_done += 1
-                                if combo_done == combo_total or combo_done % 500 == 0:
+                                progress_every = max(1, min(50, combo_total // 20 or 1))
+                                if combo_done == combo_total or combo_done % progress_every == 0:
+                                    append_symbolic_csv(args.out, pending_checkpoint_rows)
+                                    append_symbolic_csv(checkpoint_out, pending_checkpoint_rows)
+                                    pending_checkpoint_rows.clear()
                                     print(
                                         f"[symbt] model {n:,}/{len(paths):,} "
                                         f"combos={progress_text(combo_done, combo_total, model_start)} "
-                                        f"rows={model_rows:,} total_rows={len(results):,}",
+                                        f"rows={model_rows:,} total_rows={total_rows:,} checkpoint={checkpoint_out}",
                                         flush=True,
                                     )
-        print(f"[symbt] model done {n:,}/{len(paths):,} {path.name} rows={model_rows:,} total_rows={len(results):,} overall={progress_text(n, len(paths), t0)}", flush=True)
-        write_symbolic_csv(args.out, results)
+        append_symbolic_csv(args.out, pending_checkpoint_rows)
+        append_symbolic_csv(checkpoint_out, pending_checkpoint_rows)
+        pending_checkpoint_rows.clear()
+        print(f"[symbt] model done {n:,}/{len(paths):,} {path.name} rows={model_rows:,} total_rows={total_rows:,} overall={progress_text(n, len(paths), t0)}", flush=True)
 
-    filtered = [r for r in results if r.trades >= args.min_trades]
-    write_symbolic_csv(args.out, filtered)
-    print_ranked_sections(filtered, args.top)
-    print(f"[symbt] wrote {args.out} rows={len(filtered):,} elapsed={time.time() - t0:.1f}s", flush=True)
+    if args.keep_in_memory:
+        filtered = [r for r in results if r.trades >= args.min_trades]
+        write_symbolic_csv(args.out, filtered)
+        print_ranked_sections(filtered, args.top)
+        final_rows = len(filtered)
+    else:
+        final_rows = total_rows
+    print(f"[symbt] wrote {args.out} rows={final_rows:,} elapsed={time.time() - t0:.1f}s", flush=True)
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
