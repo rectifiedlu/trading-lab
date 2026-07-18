@@ -1,8 +1,9 @@
 """Train symbolic future-return formulas from raw lagged OHLC.
 
 Artifact scope is one pair/session/timeframe/window/horizon. Inputs are raw
-OHLC lags only: o0,h0,l0,c0,o1,h1,l1,c1,... Target is future close return
-in points: (close[t + horizon] - close[t]) / point_size.
+OHLC lags only: o0,h0,l0,c0,o1,h1,l1,c1,... Target is the signed dominant
+future excursion in points over candles t+1 through t+horizon. It is positive
+when the largest excursion is upward and negative when it is downward.
 """
 from __future__ import annotations
 
@@ -65,7 +66,16 @@ if njit is not None:
                 x[row, col + 2] = low[j]
                 x[row, col + 3] = close[j]
                 col += 4
-            y[row] = (close[i + horizon] - close[i]) / point_size
+            future_high = high[i + 1]
+            future_low = low[i + 1]
+            for j in range(i + 2, i + horizon + 1):
+                if high[j] > future_high:
+                    future_high = high[j]
+                if low[j] < future_low:
+                    future_low = low[j]
+            up_points = (future_high - close[i]) / point_size
+            down_points = (close[i] - future_low) / point_size
+            y[row] = up_points if up_points >= down_points else -down_points
             row += 1
         return x, y
 
@@ -83,7 +93,11 @@ def build_lagged(open_, high, low, close, valid, window: int, horizon: int, poin
             j = i - lag
             row.extend([open_[j], high[j], low[j], close[j]])
         rows.append(row)
-        targets.append((close[i + horizon] - close[i]) / point_size)
+        future_high = np.max(high[i + 1:i + horizon + 1])
+        future_low = np.min(low[i + 1:i + horizon + 1])
+        up_points = (future_high - close[i]) / point_size
+        down_points = (close[i] - future_low) / point_size
+        targets.append(up_points if up_points >= down_points else -down_points)
     return np.asarray(rows, dtype=np.float64), np.asarray(targets, dtype=np.float64)
 
 
@@ -290,7 +304,8 @@ def main() -> None:
                         meta = {
                             "pair": pair, "session": int(sess), "timeframe": tf, "window": int(window),
                             "horizon": int(horizon), "point_size": point, "backend": args.backend,
-                            "model_path": str(model_path), "feature_names": names, "target": "future_return_points",
+                            "model_path": str(model_path), "feature_names": names,
+                            "target": "signed_dominant_future_excursion_points",
                             "expression": expr, "samples": int(len(y)), "train": train_stats, "test": test_stats,
                             "fit_seconds": round(time.time() - fit_start, 3),
                         }
@@ -315,8 +330,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
 
 
 
