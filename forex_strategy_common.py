@@ -553,6 +553,11 @@ def build_parser(description: str, default_out_name: str) -> argparse.ArgumentPa
 
 def prepare_args(args) -> None:
     global BACKTEST_WINDOW_DAYS
+    if hasattr(args, "pairs"):
+        pairs: list[str] = []
+        for item in args.pairs or []:
+            pairs.extend(p.strip().upper() for p in str(item).split(",") if p.strip())
+        args.pairs = pairs or list(DEFAULT_PAIRS)
     if args.source == "local" and not args.csv:
         raise SystemExit("--csv is required for --source local")
     if args.start is None or args.to is None:
