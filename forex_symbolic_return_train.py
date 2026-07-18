@@ -110,6 +110,17 @@ def _sympy_logabs(x):
     import sympy
     return sympy.log(1 + sympy.Abs(x))
 
+
+def _sympy_max(x, y):
+    import sympy
+    return sympy.Max(x, y)
+
+
+def _sympy_min(x, y):
+    import sympy
+    return sympy.Min(x, y)
+
+
 def fit_gplearn(args, x_train: np.ndarray, y_train: np.ndarray, names: list[str]):
     from gplearn.genetic import SymbolicRegressor
 
@@ -139,6 +150,7 @@ def fit_gplearn(args, x_train: np.ndarray, y_train: np.ndarray, names: list[str]
 
 def fit_pysr(args, x_train: np.ndarray, y_train: np.ndarray, names: list[str]):
     os.environ.setdefault("JULIA_DEPOT_PATH", str((Path(args.out_dir) / ".julia").resolve()))
+    os.environ["JULIA_NUM_THREADS"] = str(max(1, args.pysr_workers))
     from pysr import PySRRegressor
 
     model = PySRRegressor(
@@ -149,9 +161,14 @@ def fit_pysr(args, x_train: np.ndarray, y_train: np.ndarray, names: list[str]):
         unary_operators=parse_str_list(args.pysr_unary_operators, DEFAULT_PYSR_UNARY_OPERATORS),
         model_selection="best",
         maxsize=args.maxsize,
-        parallelism="multiprocessing",
-        procs=max(1, args.pysr_workers),
-        extra_sympy_mappings={"sqrtabs": _sympy_sqrtabs, "logabs": _sympy_logabs},
+        constraints={"^": (-1, 1)},
+        parallelism="multithreading",
+        extra_sympy_mappings={
+            "sqrtabs": _sympy_sqrtabs,
+            "logabs": _sympy_logabs,
+            "max": _sympy_max,
+            "min": _sympy_min,
+        },
         random_state=args.seed if args.pysr_workers <= 1 else None,
         progress=bool(args.verbose),
         verbosity=1 if args.verbose else 0,
@@ -233,7 +250,7 @@ def main() -> None:
     ap.add_argument("--maxsize", type=int, default=48, help="PySR max expression size")
     ap.add_argument("--pysr-binary-operators", default=",".join(DEFAULT_PYSR_BINARY_OPERATORS))
     ap.add_argument("--pysr-unary-operators", default=",".join(DEFAULT_PYSR_UNARY_OPERATORS))
-    ap.add_argument("--pysr-workers", type=int, default=15, help="Julia worker processes per PySR fit")
+    ap.add_argument("--pysr-workers", type=int, default=15, help="Julia threads and populations per PySR fit")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--jobs", type=int, default=15, help="gplearn worker processes; PySR uses --pysr-workers")
     ap.add_argument("--verbose", action="store_true")
@@ -251,6 +268,7 @@ def main() -> None:
     done_jobs = 0
     trained_jobs = 0
     skipped_jobs = 0
+    failed_jobs = 0
     print(f"[symtrain] plan pairs={ticks['pair'].nunique()} timeframes={timeframes} sessions={sessions} windows={windows} horizons={horizons} total={total_jobs:,} backend={args.backend} pysr_workers={args.pysr_workers} train_only={int(args.train_only)}", flush=True)
 
     for pair, g in ticks.groupby("pair", sort=False):
@@ -291,7 +309,18 @@ def main() -> None:
                         x_test, y_test = x[split:], y[split:]
                         print(f"[symtrain] fit start {done_jobs + 1:,}/{total_jobs:,} pair={pair} tf={tf} sess={sess} w={window} h={horizon} backend={args.backend} train={len(y_train):,} test={len(y_test):,}", flush=True)
                         fit_start = time.time()
-                        model, expr = fit_pysr(args, x_train, y_train, names) if args.backend == "pysr" else fit_gplearn(args, x_train, y_train, names)
+                        try:
+                            model, expr = fit_pysr(args, x_train, y_train, names) if args.backend == "pysr" else fit_gplearn(args, x_train, y_train, names)
+                        except Exception as exc:
+                            done_jobs += 1
+                            failed_jobs += 1
+                            print(
+                                f"[symtrain] fit failed {progress_text(done_jobs, total_jobs, t0)} "
+                                f"failed={failed_jobs:,} pair={pair} tf={tf} sess={sess} "
+                                f"w={window} h={horizon} error={type(exc).__name__}: {exc}",
+                                flush=True,
+                            )
+                            continue
                         train_stats = split_stats(model, x_train, y_train)
                         test_stats = split_stats(model, x_test, y_test)
                         stem = f"symbolic_{safe_name(pair)}_s{sess}_tf{safe_name(tf)}_w{window}_h{horizon}_{args.backend}_seed{args.seed}"
@@ -325,13 +354,11 @@ def main() -> None:
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     print_ranked_summary(summary)
-    print(f"[symtrain] done {progress_text(done_jobs, total_jobs, t0)} models={len(summary):,} trained={trained_jobs:,} skipped={skipped_jobs:,} summary={summary_path}", flush=True)
+    print(f"[symtrain] done {progress_text(done_jobs, total_jobs, t0)} models={len(summary):,} trained={trained_jobs:,} skipped={skipped_jobs:,} failed={failed_jobs:,} summary={summary_path}", flush=True)
 
 
 if __name__ == "__main__":
     main()
-
-
 
 
 
