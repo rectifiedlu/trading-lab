@@ -521,8 +521,33 @@ def candle_state_to_ticks(
     return out
 
 
+class ForexArgumentParser(argparse.ArgumentParser):
+    """Accept signed comma-separated values without requiring --option=value."""
+
+    _SIGNED_CSV_OPTIONS = {"--sessions", "--label-sessions"}
+
+    def parse_known_args(self, args=None, namespace=None):
+        raw = list(sys.argv[1:] if args is None else args)
+        normalized: list[str] = []
+        i = 0
+        while i < len(raw):
+            token = raw[i]
+            if (
+                token in self._SIGNED_CSV_OPTIONS
+                and i + 1 < len(raw)
+                and raw[i + 1].startswith("-")
+                and "," in raw[i + 1]
+            ):
+                normalized.append(f"{token}={raw[i + 1]}")
+                i += 2
+                continue
+            normalized.append(token)
+            i += 1
+        return super().parse_known_args(normalized, namespace)
+
+
 def build_parser(description: str, default_out_name: str) -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description=description)
+    ap = ForexArgumentParser(description=description)
     ap.add_argument("--source", choices=["mt5", "local", "dukascopy"], default="mt5")
     ap.add_argument("--csv", default=DEFAULT_MT5_TICK_CSV,
                     help="local tick CSV with timestamp,bid,ask[,pair]")

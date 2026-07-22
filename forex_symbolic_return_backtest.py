@@ -6,6 +6,7 @@ import json
 import os
 import pickle
 import time
+from itertools import product
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +20,8 @@ except Exception:  # pragma: no cover
     njit = None
 
 EXIT_MODES = {"opposite": 0, "neutral": 1, "fixed": 2, "fixed_signal": 3}
-DEFAULT_THRESHOLDS = [20, 40, 60, 100, 150, 200, 300]
+GOLD_THRESHOLDS = [20, 40, 60, 100, 150, 200, 300, 400]
+FX_THRESHOLDS = [5, 10, 15, 20, 30, 45, 60, 75, 90]
 GOLD_TP = [0, 50, 100, 200, 300, 400]
 GOLD_SL = [0, 50, 100, 200, 300, 400]
 FX_TP = [0, 15, 30, 45, 60, 75, 90]
@@ -303,6 +305,10 @@ def default_tp_sl_for_pair(pair: str) -> tuple[list[float], list[float]]:
     return (GOLD_TP, GOLD_SL) if pair.upper().startswith("XAU") else (FX_TP, FX_SL)
 
 
+def default_thresholds_for_pair(pair: str) -> list[float]:
+    return GOLD_THRESHOLDS if pair.upper().startswith("XAU") else FX_THRESHOLDS
+
+
 
 def parse_pair_num_list(value: str | None, default: list[float]) -> list[float]:
     if value is None or str(value).strip().lower() in {"", "auto", "pair"}:
@@ -418,10 +424,14 @@ def main() -> None:
     ap = build_parser("Symbolic future-return formula backtest", "forex_symbolic_return_results.csv")
     ap.add_argument("--model-dir", default=os.path.join("data", "forex", "symbolic_models"))
     ap.add_argument("--model-glob", default="symbolic_*.json")
-    ap.add_argument("--thresholds", default=",".join(str(x) for x in DEFAULT_THRESHOLDS))
+    ap.add_argument("--thresholds", default="pair", help="'pair' uses separate XAU and FX point grids")
     ap.add_argument("--modes", default="normal,invert")
     ap.add_argument("--tp-modes", default="fixed,fixed_signal,opposite,neutral")
     ap.add_argument("--sl-modes", default="fixed,fixed_signal,opposite,neutral")
+    ap.add_argument("--sessions", default=None, help="filter and audit model sessions")
+    ap.add_argument("--windows", default=None, help="filter and audit model input windows")
+    ap.add_argument("--horizons", default=None, help="filter and audit model horizons")
+    ap.add_argument("--allow-incomplete-model-grid", action="store_true")
     ap.add_argument("--include-expression", action="store_true", help="repeat full symbolic expression in every result row; off by default to avoid huge memory/CSV bloat")
     ap.add_argument("--keep-in-memory", action="store_true", help="keep all rows in RAM for sorted final console output; off by default for long sweeps")
     args = ap.parse_args()
@@ -429,6 +439,9 @@ def main() -> None:
     ticks, _ = load_market(args)
     requested_pairs = {str(p).upper() for p in args.pairs}
     requested_timeframes = None if not args.timeframes else {str(tf).strip().lower() for tf in parse_str_list(args.timeframes, [])}
+    requested_sessions = None if args.sessions is None else {int(x) for x in parse_num_list(args.sessions, [])}
+    requested_windows = None if args.windows is None else {int(x) for x in parse_num_list(args.windows, [])}
+    requested_horizons = None if args.horizons is None else {int(x) for x in parse_num_list(args.horizons, [])}
     all_paths = sorted(Path(args.model_dir).glob(args.model_glob))
     if not all_paths:
         raise SystemExit(f"no model json files found: {args.model_dir}/{args.model_glob}")
@@ -443,7 +456,10 @@ def main() -> None:
                 continue
             pair_ok = str(meta_probe["pair"]).upper() in requested_pairs
             tf_ok = requested_timeframes is None or str(meta_probe.get("timeframe", "")).strip().lower() in requested_timeframes
-            if pair_ok and tf_ok:
+            session_ok = requested_sessions is None or int(meta_probe.get("session", -999)) in requested_sessions
+            window_ok = requested_windows is None or int(meta_probe.get("window", -1)) in requested_windows
+            horizon_ok = requested_horizons is None or int(meta_probe.get("horizon", -1)) in requested_horizons
+            if pair_ok and tf_ok and session_ok and window_ok and horizon_ok:
                 paths.append(path)
         except Exception:
             skipped_meta += 1
@@ -452,6 +468,42 @@ def main() -> None:
         raise SystemExit(f"no usable model json files for pairs={sorted(requested_pairs)} timeframes={tf_msg} in {args.model_dir}/{args.model_glob}")
     if skipped_meta:
         print(f"[symbt] skipped non-model/bad json files={skipped_meta:,}", flush=True)
+    audit_sets = (
+        requested_timeframes,
+        requested_sessions,
+        requested_windows,
+        requested_horizons,
+    )
+    if all(values is not None for values in audit_sets):
+        expected_keys = set(product(
+            requested_pairs,
+            requested_timeframes,
+            requested_sessions,
+            requested_windows,
+            requested_horizons,
+        ))
+        actual_keys = []
+        for path in paths:
+            with open(path, "r", encoding="utf-8") as f:
+                meta_audit = json.load(f)
+            actual_keys.append((
+                str(meta_audit["pair"]).upper(),
+                str(meta_audit["timeframe"]).strip().lower(),
+                int(meta_audit["session"]),
+                int(meta_audit["window"]),
+                int(meta_audit["horizon"]),
+            ))
+        actual_key_set = set(actual_keys)
+        missing = sorted(expected_keys - actual_key_set)
+        duplicates = len(actual_keys) - len(actual_key_set)
+        if (missing or duplicates) and not args.allow_incomplete_model_grid:
+            preview = missing[:12]
+            raise SystemExit(
+                f"[symbt] incomplete model grid expected={len(expected_keys):,} "
+                f"found={len(actual_key_set):,} missing={len(missing):,} "
+                f"duplicates={duplicates:,} first_missing={preview}; "
+                "rerun training or pass --allow-incomplete-model-grid"
+            )
     model_counts: dict[str, int] = {}
     model_tf_counts: dict[str, int] = {}
     for path in paths:
@@ -469,7 +521,9 @@ def main() -> None:
         f"models_by_pair={model_counts} models_by_pair_tf={model_tf_counts}",
         flush=True,
     )
-    thresholds = parse_num_list(args.thresholds, DEFAULT_THRESHOLDS)
+    threshold_override = None
+    if str(args.thresholds).strip().lower() not in {"", "auto", "pair"}:
+        threshold_override = parse_num_list(args.thresholds, [])
     modes = parse_str_list(args.modes, ["normal", "invert"])
     tp_modes = parse_exit_modes(args.tp_modes, ["fixed", "fixed_signal", "opposite", "neutral"])
     sl_modes = parse_exit_modes(args.sl_modes, ["fixed", "fixed_signal", "opposite", "neutral"])
@@ -484,7 +538,7 @@ def main() -> None:
         os.remove(checkpoint_out)
         print(f"[symbt] overwrite checkpoint={checkpoint_out}", flush=True)
     print(
-        f"[symbt] plan models={len(paths):,} thresholds={thresholds} modes={modes} "
+        f"[symbt] plan models={len(paths):,} thresholds={'pair-specific' if threshold_override is None else threshold_override} modes={modes} "
         f"tp_modes={tp_modes} sl_modes={sl_modes} out={args.out}",
         flush=True,
     )
@@ -516,6 +570,7 @@ def main() -> None:
             flush=True,
         )
         tp_default, sl_default = default_tp_sl_for_pair(pair)
+        thresholds = default_thresholds_for_pair(pair) if threshold_override is None else threshold_override
         tp_values = parse_pair_num_list(args.tp_points, tp_default)
         sl_values = parse_pair_num_list(args.sl_points, sl_default)
         model_rows = 0
@@ -529,7 +584,7 @@ def main() -> None:
         model_start = time.time()
         print(
             f"[symbt] model start {n:,}/{len(paths):,} {path.name} "
-            f"candles={len(close):,} ticks={len(g):,} combos={combo_total:,}",
+            f"candles={len(close):,} ticks={len(g):,} thresholds={thresholds} combos={combo_total:,}",
             flush=True,
         )
         for threshold in thresholds:

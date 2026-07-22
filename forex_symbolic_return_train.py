@@ -236,7 +236,7 @@ def main() -> None:
     ap.add_argument("--train-frac", type=float, default=0.70)
     ap.add_argument("--train-only", action="store_true", help="fit on all available samples; no held-out test split")
     ap.add_argument("--max-samples", type=int, default=50000)
-    ap.add_argument("--min-samples", type=int, default=1000)
+    ap.add_argument("--min-samples", type=int, default=100)
     ap.add_argument("--population", type=int, default=1200)
     ap.add_argument("--generations", type=int, default=40)
     ap.add_argument("--tournament-size", type=int, default=20)
@@ -251,6 +251,7 @@ def main() -> None:
     ap.add_argument("--pysr-binary-operators", default=",".join(DEFAULT_PYSR_BINARY_OPERATORS))
     ap.add_argument("--pysr-unary-operators", default=",".join(DEFAULT_PYSR_UNARY_OPERATORS))
     ap.add_argument("--pysr-workers", type=int, default=15, help="Julia threads and populations per PySR fit")
+    ap.add_argument("--fit-retries", type=int, default=2, help="retries after a failed model fit")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--jobs", type=int, default=15, help="gplearn worker processes; PySR uses --pysr-workers")
     ap.add_argument("--verbose", action="store_true")
@@ -309,15 +310,30 @@ def main() -> None:
                         x_test, y_test = x[split:], y[split:]
                         print(f"[symtrain] fit start {done_jobs + 1:,}/{total_jobs:,} pair={pair} tf={tf} sess={sess} w={window} h={horizon} backend={args.backend} train={len(y_train):,} test={len(y_test):,}", flush=True)
                         fit_start = time.time()
-                        try:
-                            model, expr = fit_pysr(args, x_train, y_train, names) if args.backend == "pysr" else fit_gplearn(args, x_train, y_train, names)
-                        except Exception as exc:
+                        model = None
+                        expr = ""
+                        fit_error = None
+                        attempts = max(1, args.fit_retries + 1)
+                        for attempt in range(1, attempts + 1):
+                            try:
+                                model, expr = fit_pysr(args, x_train, y_train, names) if args.backend == "pysr" else fit_gplearn(args, x_train, y_train, names)
+                                fit_error = None
+                                break
+                            except Exception as exc:
+                                fit_error = exc
+                                print(
+                                    f"[symtrain] fit error attempt={attempt}/{attempts} "
+                                    f"pair={pair} tf={tf} sess={sess} w={window} h={horizon} "
+                                    f"error={type(exc).__name__}: {exc}",
+                                    flush=True,
+                                )
+                        if model is None:
                             done_jobs += 1
                             failed_jobs += 1
                             print(
                                 f"[symtrain] fit failed {progress_text(done_jobs, total_jobs, t0)} "
                                 f"failed={failed_jobs:,} pair={pair} tf={tf} sess={sess} "
-                                f"w={window} h={horizon} error={type(exc).__name__}: {exc}",
+                                f"w={window} h={horizon} error={type(fit_error).__name__}: {fit_error}",
                                 flush=True,
                             )
                             continue
@@ -343,7 +359,7 @@ def main() -> None:
                         summary.append(meta)
                         done_jobs += 1
                         trained_jobs += 1
-                        print(f"[symtrain] fit done {progress_text(done_jobs, total_jobs, t0)} trained={trained_jobs:,} skipped={skipped_jobs:,} fit={fmt_elapsed(time.time() - fit_start)} test_mae={test_stats['mae']} test_corr={test_stats['corr']} expr={expr}", flush=True)
+                        print(f"[symtrain] fit done {progress_text(done_jobs, total_jobs, t0)} trained={trained_jobs:,} skipped={skipped_jobs:,} failed={failed_jobs:,} fit={fmt_elapsed(time.time() - fit_start)} test_mae={test_stats['mae']} test_corr={test_stats['corr']} expr={expr}", flush=True)
                         print(f"[symtrain] wrote {meta_path}", flush=True)
 
     summary.sort(key=rank_corr, reverse=True)
@@ -355,10 +371,14 @@ def main() -> None:
         json.dump(summary, f, indent=2)
     print_ranked_summary(summary)
     print(f"[symtrain] done {progress_text(done_jobs, total_jobs, t0)} models={len(summary):,} trained={trained_jobs:,} skipped={skipped_jobs:,} failed={failed_jobs:,} summary={summary_path}", flush=True)
+    if skipped_jobs or failed_jobs or trained_jobs != total_jobs:
+        raise SystemExit(
+            f"[symtrain] INCOMPLETE expected={total_jobs:,} trained={trained_jobs:,} "
+            f"skipped={skipped_jobs:,} failed={failed_jobs:,}"
+        )
 
 
 if __name__ == "__main__":
     main()
-
 
 
