@@ -113,12 +113,12 @@ def _sympy_logabs(x):
 
 def _sympy_max(x, y):
     import sympy
-    return sympy.Max(x, y)
+    return (x + y + sympy.Abs(x - y)) / 2
 
 
 def _sympy_min(x, y):
     import sympy
-    return sympy.Min(x, y)
+    return (x + y - sympy.Abs(x - y)) / 2
 
 
 def fit_gplearn(args, x_train: np.ndarray, y_train: np.ndarray, names: list[str]):
@@ -313,10 +313,18 @@ def main() -> None:
                         model = None
                         expr = ""
                         fit_error = None
+                        train_stats = None
+                        test_stats = None
                         attempts = max(1, args.fit_retries + 1)
                         for attempt in range(1, attempts + 1):
                             try:
-                                model, expr = fit_pysr(args, x_train, y_train, names) if args.backend == "pysr" else fit_gplearn(args, x_train, y_train, names)
+                                candidate, candidate_expr = fit_pysr(args, x_train, y_train, names) if args.backend == "pysr" else fit_gplearn(args, x_train, y_train, names)
+                                candidate_train_stats = split_stats(candidate, x_train, y_train)
+                                candidate_test_stats = split_stats(candidate, x_test, y_test)
+                                model = candidate
+                                expr = candidate_expr
+                                train_stats = candidate_train_stats
+                                test_stats = candidate_test_stats
                                 fit_error = None
                                 break
                             except Exception as exc:
@@ -332,13 +340,11 @@ def main() -> None:
                             failed_jobs += 1
                             print(
                                 f"[symtrain] fit failed {progress_text(done_jobs, total_jobs, t0)} "
-                                f"failed={failed_jobs:,} pair={pair} tf={tf} sess={sess} "
-                                f"w={window} h={horizon} error={type(fit_error).__name__}: {fit_error}",
+                                f"failed={failed_jobs:,} pair={pair} tf={tf} sess={sess} w={window} h={horizon} "
+                                f"error={type(fit_error).__name__}: {fit_error}",
                                 flush=True,
                             )
                             continue
-                        train_stats = split_stats(model, x_train, y_train)
-                        test_stats = split_stats(model, x_test, y_test)
                         stem = f"symbolic_{safe_name(pair)}_s{sess}_tf{safe_name(tf)}_w{window}_h{horizon}_{args.backend}_seed{args.seed}"
                         model_path = Path(args.out_dir) / f"{stem}.pkl"
                         meta_path = Path(args.out_dir) / f"{stem}.json"
