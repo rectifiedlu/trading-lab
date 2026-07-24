@@ -152,6 +152,10 @@ def _predict_batch(model, device, ns, batch_x, batch_extra, batch_idx, preds) ->
             p = torch.sigmoid(raw[:, :2])
             moves = torch.relu(raw[:, 2:]) * float(getattr(ns, "move_scale_points", 100.0))
             out = torch.cat([p, moves], dim=1).cpu().numpy()
+        elif getattr(ns, "target", "") == "excursion":
+            score = raw.reshape(-1, 1) * float(getattr(ns, "move_scale_points", 100.0))
+            empty = torch.full_like(score, float("nan"))
+            out = torch.cat([score, empty, empty, empty], dim=1).cpu().numpy()
         else:
             p_up = torch.sigmoid(raw).reshape(-1, 1)
             # Single-probability models use pShort = 1 - pLong. Exp fields are

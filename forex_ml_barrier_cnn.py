@@ -28,7 +28,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from forex_strategy_common import active_session_allowed, default_point_size, load_market, parse_num_list
+from forex_strategy_common import ForexArgumentParser, active_session_allowed, default_point_size, load_market, parse_num_list
 
 try:
     from numba import njit
@@ -396,7 +396,61 @@ def label_nextbar(close: np.ndarray, horizon: int = 1) -> tuple[np.ndarray, np.n
     return labels, valid
 
 
+def label_excursion(
+    close: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    horizon: int,
+    point_size: float,
+    scale_points: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Signed dominant future excursion, scaled for regression training."""
+    if njit is not None:
+        return _label_excursion_numba(close, high, low, horizon, point_size, scale_points)
+    labels = np.zeros(len(close), dtype=np.float32)
+    valid = np.zeros(len(close), dtype=np.bool_)
+    scale = max(float(scale_points), 1.0)
+    stop = len(close) - horizon
+    for i in range(max(stop, 0)):
+        future_high = np.max(high[i + 1:i + horizon + 1])
+        future_low = np.min(low[i + 1:i + horizon + 1])
+        up_points = (future_high - close[i]) / point_size
+        down_points = (close[i] - future_low) / point_size
+        score = up_points if up_points >= down_points else -down_points
+        labels[i] = np.float32(score / scale)
+        valid[i] = True
+    return labels, valid
+
+
 if njit is not None:
+    @njit(cache=True)
+    def _label_excursion_numba(
+        close: np.ndarray,
+        high: np.ndarray,
+        low: np.ndarray,
+        horizon: int,
+        point_size: float,
+        scale_points: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        labels = np.zeros(len(close), dtype=np.float32)
+        valid = np.zeros(len(close), dtype=np.bool_)
+        scale = scale_points if scale_points >= 1.0 else 1.0
+        stop = len(close) - horizon
+        for i in range(stop):
+            future_high = high[i + 1]
+            future_low = low[i + 1]
+            for j in range(i + 2, i + horizon + 1):
+                if high[j] > future_high:
+                    future_high = high[j]
+                if low[j] < future_low:
+                    future_low = low[j]
+            up_points = (future_high - close[i]) / point_size
+            down_points = (close[i] - future_low) / point_size
+            score = up_points if up_points >= down_points else -down_points
+            labels[i] = np.float32(score / scale)
+            valid[i] = True
+        return labels, valid
+
     @njit(cache=True)
     def _label_move4_numba(
         close: np.ndarray,
@@ -903,7 +957,7 @@ def build_model(name: str, window: int, input_dim: int, extra_dim: int, args: ar
     out_dim = model_output_dim(args)
     if model_name == "cnn":
         return CandleCNN(window, input_dim=input_dim, extra_dim=extra_dim, channels=args.channels, kernel=args.kernel_size, dropout=args.dropout, output_dim=out_dim)
-    if model_name in {"tcn", "tcn2"}:
+    if model_name in {"tcn", "tcn2", "tcn3"}:
         return TemporalConvNet(window, input_dim=input_dim, extra_dim=extra_dim, channels=args.channels, kernel=args.kernel_size, layers=args.layers, dropout=args.dropout, output_dim=out_dim)
     if model_name == "mlp":
         return FlatMLP(window, input_dim=input_dim, extra_dim=extra_dim, hidden=args.hidden, dropout=args.dropout, output_dim=out_dim)
@@ -970,6 +1024,8 @@ def train_model(args: argparse.Namespace, data: BarrierData, train_idx: np.ndarr
             logits = model(x, extra)
             if args.target == "move4":
                 loss = loss_fn(logits[:, :2], y[:, :2]) + args.move_reg_weight * reg_loss_fn(torch.relu(logits[:, 2:]), y[:, 2:])
+            elif args.target == "excursion":
+                loss = reg_loss_fn(logits.reshape(-1), y.reshape(-1))
             else:
                 loss = loss_fn(logits, y)
             loss.backward()
@@ -980,7 +1036,7 @@ def train_model(args: argparse.Namespace, data: BarrierData, train_idx: np.ndarr
         acc, bce = evaluate_model(model, eval_loader, device, args)
         if args.verbose or epoch == args.epochs:
             eval_name = "test" if len(test_idx) else "train"
-            print(f"[ml] epoch {epoch:02d} train_bce={train_loss:.4f} {eval_name}_bce={bce:.4f} {eval_name}_acc={acc*100:.2f}%", flush=True)
+            print(f"[ml] epoch {epoch:02d} train_loss={train_loss:.4f} {eval_name}_loss={bce:.4f} {eval_name}_direction_acc={acc*100:.2f}%", flush=True)
     return model, device
 
 
@@ -1001,6 +1057,11 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, a
                 pred = torch.argmax(logits[:, :2], dim=1)
                 truth = torch.argmax(y[:, :2], dim=1)
                 correct += int((pred == truth).sum().item())
+            elif args.target == "excursion":
+                pred_score = logits.reshape(-1)
+                true_score = y.reshape(-1)
+                loss += float(nn.functional.smooth_l1_loss(pred_score, true_score, reduction="sum").item())
+                correct += int(((pred_score >= 0.0) == (true_score >= 0.0)).sum().item())
             else:
                 loss += float(loss_fn(logits, y).item())
                 pred = (torch.sigmoid(logits) >= 0.5).float()
@@ -1021,6 +1082,8 @@ def predict_probs(model: nn.Module, device: torch.device, data: BarrierData, idx
                 p_dir = torch.sigmoid(raw[:, :2])
                 moves = torch.relu(raw[:, 2:]) * float(args.move_scale_points)
                 p = torch.cat([p_dir, moves], dim=1).cpu().numpy()
+            elif args.target == "excursion":
+                p = (raw.reshape(-1, 1) * float(args.move_scale_points)).cpu().numpy()
             else:
                 p = torch.sigmoid(raw).cpu().numpy()
             out.append(p)
@@ -1528,7 +1591,7 @@ def arch_combos_for_model(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="Raw OHLC CNN barrier model")
+    ap = ForexArgumentParser(description="Raw OHLC CNN barrier model")
     ap.add_argument("--source", choices=["mt5", "local", "dukascopy"], default="mt5")
     ap.add_argument("--ohlc-source", choices=["ticks", "native"], default="ticks",
                     help="ticks = build bid candles from ticks; native = use MT5 copy_rates_range candles")
@@ -1545,11 +1608,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="single timeframe override")
     ap.add_argument("--timeframes", default=",".join(DEFAULT_TIMEFRAMES),
                     help="comma list of timeframes to sweep")
-    ap.add_argument("--target", choices=["barrier", "trade", "tpsl_direction", "move4", "nextbar"], default="move4",
-                    help="barrier = equal up/down first; trade = side-specific win label; tpsl_direction = fixed TP/SL direction; move4 = long/short prob + max up/down forecast; nextbar = future close up probability")
+    ap.add_argument("--target", choices=["barrier", "trade", "tpsl_direction", "move4", "nextbar", "excursion"], default="move4",
+                    help="barrier = equal up/down first; trade = side-specific win label; tpsl_direction = fixed TP/SL direction; move4 = long/short prob + max up/down forecast; nextbar = future close up probability; excursion = signed dominant future excursion")
     ap.add_argument("--trade-side", choices=["long", "short"], default="long",
                     help="side to label when --target trade")
-    ap.add_argument("--model", choices=["cnn", "tcn", "tcn2", "mlp", "linear", "gru", "lstm", "transformer", "rf", "xgb"], default="tcn")
+    ap.add_argument("--model", choices=["cnn", "tcn", "tcn2", "tcn3", "mlp", "linear", "gru", "lstm", "transformer", "rf", "xgb"], default="tcn")
     ap.add_argument("--models", default=None,
                     help="comma list of models to sweep; overrides --model")
     ap.add_argument("--window", type=int, default=128)
@@ -1639,10 +1702,15 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def run_one(args: argparse.Namespace, data: BarrierData) -> None:
+def run_one(args: argparse.Namespace, data: BarrierData) -> bool:
+    if args.target == "excursion" and not args.train_only:
+        raise SystemExit("--target excursion trains models only; use --train-only and forex_tcn3_excursion_backtest.py")
     if args.target == "move4":
         label_tag = f"scale{float(args.move_scale_points):g}"
         side_tag = "both"
+    elif args.target == "excursion":
+        label_tag = f"scale{float(args.move_scale_points):g}"
+        side_tag = "score"
     elif args.target == "nextbar":
         label_tag = "nextbar"
         side_tag = "up"
@@ -1686,6 +1754,16 @@ def run_one(args: argparse.Namespace, data: BarrierData) -> None:
         if label_session != -1:
             ts_ns = pd.to_datetime(data.times, utc=True).astype("int64").to_numpy(np.int64)
             valid &= active_session_allowed(ts_ns, label_session)
+    elif args.target == "excursion":
+        labels, valid = label_excursion(
+            close, high, low,
+            args.horizon_bars,
+            data.point_size,
+            float(args.move_scale_points),
+        )
+        label_session = int(getattr(args, "label_session", 0))
+        ts_ns = pd.to_datetime(data.times, utc=True).astype("int64").to_numpy(np.int64)
+        valid &= active_session_allowed(ts_ns, label_session)
     elif args.target == "nextbar":
         labels, valid = label_nextbar(close, args.horizon_bars)
         label_session = int(getattr(args, "label_session", -1))
@@ -1728,6 +1806,9 @@ def run_one(args: argparse.Namespace, data: BarrierData) -> None:
     if args.target == "move4":
         train_up = float(np.mean(np.argmax(data.labels[train_idx, :2], axis=1))) * 100.0 if len(train_idx) else 0.0
         test_up = float(np.mean(np.argmax(data.labels[test_idx, :2], axis=1))) * 100.0 if len(test_idx) else 0.0
+    elif args.target == "excursion":
+        train_up = float(np.mean(data.labels[train_idx] >= 0.0)) * 100.0 if len(train_idx) else 0.0
+        test_up = float(np.mean(data.labels[test_idx] >= 0.0)) * 100.0 if len(test_idx) else 0.0
     else:
         train_up = float(np.mean(data.labels[train_idx])) * 100.0 if len(train_idx) else 0.0
         test_up = float(np.mean(data.labels[test_idx])) * 100.0 if len(test_idx) else 0.0
@@ -1750,9 +1831,9 @@ def run_one(args: argparse.Namespace, data: BarrierData) -> None:
             "increase days, reduce window/horizon, or lower min sample thresholds",
             flush=True,
         )
-        return
-    if args.target == "move4" and args.model in {"rf", "xgb"}:
-        raise SystemExit("--target move4 currently supports torch models only: tcn,cnn,gru,lstm,transformer,mlp,linear")
+        return False
+    if args.target in {"move4", "excursion"} and args.model in {"rf", "xgb"}:
+        raise SystemExit("--target move4/excursion currently supports torch models only")
     if args.model in {"rf", "xgb"}:
         model, probs = train_tree_model(args, data, train_idx, test_idx)
     else:
@@ -1760,7 +1841,7 @@ def run_one(args: argparse.Namespace, data: BarrierData) -> None:
     if args.train_only:
         save_any_model(model, args.model_out, args, train_idx, test_idx, data)
         append_notes(args.notes_out, args, [], train_idx, test_idx)
-        return
+        return True
     if args.model in {"rf", "xgb"}:
         # tree models already produced probabilities above
         pass
@@ -1801,6 +1882,7 @@ def run_one(args: argparse.Namespace, data: BarrierData) -> None:
     export_predictions(data, pred_idx, pred_probs, args.pred_out, args)
     save_any_model(model, args.model_out, args, train_idx, test_idx, data)
     append_notes(args.notes_out, args, rows if rows else external_rows, train_idx, test_idx)
+    return True
 
 
 def main() -> None:
@@ -1839,7 +1921,7 @@ def main() -> None:
     grand_total = 0
     pair_label_grids: dict[str, list[tuple[float, float, int]]] = {}
     for pair in pairs:
-        if args.target == "move4":
+        if args.target in {"move4", "excursion"}:
             scale = float(args.move_scale_points) if args.move_scale_points is not None else max(default_eval_tp_for_pair(pair))
             label_sessions = [int(x) for x in parse_num_list(args.label_sessions, [-1, 0, 1, 2])]
             label_grid = [(scale, scale, int(sess)) for sess in label_sessions]
@@ -1863,6 +1945,7 @@ def main() -> None:
         pair_label_grids[pair] = label_grid
         grand_total += len(timeframes) * len(label_grid) * len(windows) * len(horizons) * total_arch
     done = 0
+    trained = 0
     for pair in pairs:
         pair_args = copy(args)
         pair_args.pair = pair
@@ -1911,8 +1994,11 @@ def main() -> None:
                                     f"channels={channels} kernel={kernel} layers={layers} hidden={hidden} dropout={float(dropout):g}",
                                     flush=True,
                                 )
-                                run_one(run_args, data)
-    print(f"[ml] elapsed={time.time() - t0:.1f}s", flush=True)
+                                if run_one(run_args, data):
+                                    trained += 1
+    print(f"[ml] elapsed={time.time() - t0:.1f}s trained={trained}/{grand_total}", flush=True)
+    if args.target == "excursion" and trained != grand_total:
+        raise SystemExit(f"[ml] INCOMPLETE expected={grand_total} trained={trained} skipped={grand_total - trained}")
 
 
 if __name__ == "__main__":
