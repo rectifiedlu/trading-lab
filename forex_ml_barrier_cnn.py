@@ -671,6 +671,95 @@ def make_window_features(data: BarrierData, idx: int, window: int, barrier_point
     return np.clip(features, -10.0, 10.0).T.astype(np.float32)
 
 
+if njit is not None:
+    @njit(cache=True, inline="always")
+    def _clip_feature_numba(value: float) -> np.float32:
+        if value > 10.0:
+            return np.float32(10.0)
+        if value < -10.0:
+            return np.float32(-10.0)
+        return np.float32(value)
+
+
+    @njit(cache=True)
+    def _make_window_feature_batch_numba(
+        ohlc: np.ndarray,
+        spread: np.ndarray,
+        session: np.ndarray,
+        indices: np.ndarray,
+        window: int,
+        point_size: float,
+        barrier_points: float,
+        feature_count: int,
+    ) -> np.ndarray:
+        out = np.empty((len(indices), feature_count, window), dtype=np.float32)
+        scale = point_size * barrier_points
+        if scale < 1e-12:
+            scale = 1e-12
+        for row in range(len(indices)):
+            end = int(indices[row])
+            start = end - window + 1
+            ref = ohlc[end, 3]
+            for offset in range(window):
+                i = start + offset
+                open_value = ohlc[i, 0]
+                high_value = ohlc[i, 1]
+                low_value = ohlc[i, 2]
+                close_value = ohlc[i, 3]
+                out[row, 0, offset] = _clip_feature_numba((open_value - ref) / scale)
+                out[row, 1, offset] = _clip_feature_numba((high_value - ref) / scale)
+                out[row, 2, offset] = _clip_feature_numba((low_value - ref) / scale)
+                out[row, 3, offset] = _clip_feature_numba((close_value - ref) / scale)
+                if feature_count == 4:
+                    continue
+                range_raw = high_value - low_value
+                if range_raw < point_size:
+                    range_raw = point_size
+                max_body = open_value if open_value > close_value else close_value
+                min_body = open_value if open_value < close_value else close_value
+                previous_close = close_value if offset == 0 else ohlc[i - 1, 3]
+                out[row, 4, offset] = _clip_feature_numba((close_value - open_value) / scale)
+                out[row, 5, offset] = _clip_feature_numba(range_raw / scale)
+                out[row, 6, offset] = _clip_feature_numba((high_value - max_body) / scale)
+                out[row, 7, offset] = _clip_feature_numba((min_body - low_value) / scale)
+                out[row, 8, offset] = _clip_feature_numba((close_value - previous_close) / scale)
+                out[row, 9, offset] = _clip_feature_numba((close_value - low_value) / range_raw)
+                out[row, 10, offset] = _clip_feature_numba(spread[i] / scale)
+                out[row, 11, offset] = _clip_feature_numba(session[i])
+        return out
+
+
+def make_window_feature_batch(
+    data: BarrierData,
+    indices: np.ndarray,
+    window: int,
+    barrier_points: float,
+    feature_set: str,
+) -> np.ndarray:
+    """Build model window tensors in one compiled batch."""
+    index_array = np.asarray(indices, dtype=np.int64)
+    feature_count = len(feature_names(feature_set))
+    if len(index_array) == 0:
+        return np.empty((0, feature_count, int(window)), dtype=np.float32)
+    if int(np.min(index_array)) < int(window) - 1 or int(np.max(index_array)) >= len(data.ohlc):
+        raise ValueError("feature indices fall outside the available candle/window range")
+    if njit is not None:
+        return _make_window_feature_batch_numba(
+            np.ascontiguousarray(data.ohlc, dtype=np.float32),
+            np.ascontiguousarray(data.spread, dtype=np.float32),
+            np.ascontiguousarray(data.session, dtype=np.float32),
+            index_array,
+            int(window),
+            float(data.point_size),
+            float(barrier_points),
+            int(feature_count),
+        )
+    return np.stack([
+        make_window_features(data, int(i), int(window), float(barrier_points), feature_set)
+        for i in index_array
+    ]).astype(np.float32)
+
+
 def load_barrier_data(args: argparse.Namespace) -> BarrierData:
     point_size = float(args.point_size or default_point_size(args.pair))
     if args.ohlc_source == "native":
@@ -761,26 +850,25 @@ class PrecomputedBarrierDataset(Dataset):
         self.indices = indices.astype(np.int64)
         self.window = int(window)
         self.input_dim = len(feature_names(feature_set))
-        self.x = np.empty((len(self.indices), self.input_dim, self.window), dtype=np.float32)
-        extra_dim = 6 if use_session_feature else 5
-        self.extra = np.empty((len(self.indices), extra_dim), dtype=np.float32)
-        self.y = np.empty((len(self.indices),) + np.shape(data.labels[0]), dtype=np.float32)
-        time_feat = make_time_features(data.times)
+        feature_batch = make_window_feature_batch(
+            data,
+            self.indices,
+            self.window,
+            float(barrier_points),
+            feature_set,
+        )
+        time_feat = make_time_features(data.times)[self.indices]
         scale = max(data.point_size * float(barrier_points), 1e-12)
-        for row, i_raw in enumerate(self.indices):
-            i = int(i_raw)
-            self.x[row] = make_window_features(data, i, self.window, barrier_points, feature_set)
-            extra_values = [
-                data.spread[i] / scale,
-                *time_feat[i],
-            ]
-            if use_session_feature:
-                extra_values.insert(1, data.session[i])
-            self.extra[row] = np.asarray(extra_values, dtype=np.float32)
-            self.y[row] = np.asarray(data.labels[i], dtype=np.float32)
-        self.x = torch.from_numpy(self.x)
-        self.extra = torch.from_numpy(self.extra)
-        self.y = torch.from_numpy(self.y)
+        spread_feature = (data.spread[self.indices] / scale).reshape(-1, 1)
+        if use_session_feature:
+            session_feature = data.session[self.indices].reshape(-1, 1)
+            extra_batch = np.concatenate([spread_feature, session_feature, time_feat], axis=1)
+        else:
+            extra_batch = np.concatenate([spread_feature, time_feat], axis=1)
+        label_batch = np.asarray(data.labels[self.indices], dtype=np.float32)
+        self.x = torch.from_numpy(np.ascontiguousarray(feature_batch, dtype=np.float32))
+        self.extra = torch.from_numpy(np.ascontiguousarray(extra_batch, dtype=np.float32))
+        self.y = torch.from_numpy(np.ascontiguousarray(label_batch, dtype=np.float32))
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -984,17 +1072,25 @@ def split_indices(data: BarrierData, window: int, train_frac: float, max_samples
 
 def train_model(args: argparse.Namespace, data: BarrierData, train_idx: np.ndarray, test_idx: np.ndarray):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    amp_enabled = device.type == "cuda" and not bool(getattr(args, "no_amp", False))
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
     if args.verbose:
-        print(f"[ml] device={device} {torch.cuda.get_device_name(0) if device.type == 'cuda' else ''}", flush=True)
+        print(
+            f"[ml] device={device} amp={int(amp_enabled)} "
+            f"{torch.cuda.get_device_name(0) if device.type == 'cuda' else ''}",
+            flush=True,
+        )
     ds_cls = BarrierDataset if args.no_precompute_features else PrecomputedBarrierDataset
     prep_t0 = time.time()
     train_ds = ds_cls(data, train_idx, args.window, args.barrier_points, args.feature_set, args.session_feature)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=device.type == "cuda")
     eval_idx = test_idx if len(test_idx) else train_idx
     eval_ds = train_ds if len(test_idx) == 0 and not args.no_precompute_features else ds_cls(data, eval_idx, args.window, args.barrier_points, args.feature_set, args.session_feature)
-    eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=device.type == "cuda")
     if args.verbose:
         mode = "lazy" if args.no_precompute_features else "precomputed"
         print(f"[ml] dataset={mode} train={len(train_idx):,} eval={len(eval_idx):,} prep={time.time() - prep_t0:.1f}s", flush=True)
@@ -1011,25 +1107,28 @@ def train_model(args: argparse.Namespace, data: BarrierData, train_idx: np.ndarr
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     loss_fn = nn.BCEWithLogitsLoss()
     reg_loss_fn = nn.SmoothL1Loss()
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = 0.0
         seen = 0
         for x, extra, y in train_loader:
-            x = x.to(device)
-            extra = extra.to(device)
-            y = y.to(device)
+            x = x.to(device, non_blocking=device.type == "cuda")
+            extra = extra.to(device, non_blocking=device.type == "cuda")
+            y = y.to(device, non_blocking=device.type == "cuda")
             opt.zero_grad(set_to_none=True)
-            logits = model(x, extra)
-            if args.target == "move4":
-                loss = loss_fn(logits[:, :2], y[:, :2]) + args.move_reg_weight * reg_loss_fn(torch.relu(logits[:, 2:]), y[:, 2:])
-            elif args.target == "excursion":
-                loss = reg_loss_fn(logits.reshape(-1), y.reshape(-1))
-            else:
-                loss = loss_fn(logits, y)
-            loss.backward()
-            opt.step()
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+                logits = model(x, extra)
+                if args.target == "move4":
+                    loss = loss_fn(logits[:, :2], y[:, :2]) + args.move_reg_weight * reg_loss_fn(torch.relu(logits[:, 2:]), y[:, 2:])
+                elif args.target == "excursion":
+                    loss = reg_loss_fn(logits.reshape(-1), y.reshape(-1))
+                else:
+                    loss = loss_fn(logits, y)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             total_loss += float(loss.item()) * len(y)
             seen += len(y)
         train_loss = total_loss / max(seen, 1)
@@ -1048,10 +1147,12 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, a
     loss = 0.0
     with torch.no_grad():
         for x, extra, y in loader:
-            x = x.to(device)
-            extra = extra.to(device)
-            y = y.to(device)
-            logits = model(x, extra)
+            x = x.to(device, non_blocking=device.type == "cuda")
+            extra = extra.to(device, non_blocking=device.type == "cuda")
+            y = y.to(device, non_blocking=device.type == "cuda")
+            amp_enabled = device.type == "cuda" and not bool(getattr(args, "no_amp", False))
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+                logits = model(x, extra)
             if args.target == "move4":
                 loss += float(loss_fn(logits[:, :2], y[:, :2]).item())
                 pred = torch.argmax(logits[:, :2], dim=1)
@@ -1668,6 +1769,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="comma list of dropout values to sweep")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--cpu", action="store_true")
+    ap.add_argument("--no-amp", action="store_true",
+                    help="disable CUDA mixed precision; AMP is enabled automatically on CUDA")
     ap.add_argument("--session-feature", action="store_true",
                     help="include inside-session flag as a model input; off by default")
     ap.add_argument("--point-size", type=float, default=None)

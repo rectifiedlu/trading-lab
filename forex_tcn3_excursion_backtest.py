@@ -18,7 +18,8 @@ from forex_ml_tick_simulator import (
     load_torch_model,
     model_files,
     parse_model_name,
-    predict_model,
+    predict_prepared_model,
+    prepare_model_inputs,
 )
 from forex_strategy_common import (
     active_session_allowed,
@@ -121,6 +122,14 @@ def main() -> None:
     ]
     if not paths:
         raise SystemExit("no matching TCN3 excursion models found")
+    paths.sort(key=lambda path: (
+        str(parse_model_name(path).get("pair", "")).upper(),
+        str(parse_model_name(path).get("tf", "")).lower(),
+        str(parse_model_name(path).get("feature_set", "")),
+        int(parse_model_name(path).get("window", 0)),
+        float(parse_model_name(path).get("scale", 0.0)),
+        path.name,
+    ))
 
     audit_model_grid(
         paths,
@@ -168,22 +177,48 @@ def main() -> None:
         flush=True,
     )
 
+    active_pair = None
+    bid = ask = ts_ns = None
+    candle_cache = {}
+    prepared_key = None
+    prepared_inputs = None
     for model_number, path in enumerate(paths, 1):
         model_start = time.time()
         meta = parse_model_name(path)
         pair = str(meta["pair"]).upper()
-        pair_ticks = ticks[ticks["pair"].str.upper() == pair].sort_values("timestamp").reset_index(drop=True)
-        if pair_ticks.empty:
-            raise SystemExit(f"[tcn3] no ticks loaded for model pair={pair}")
+        timeframe = str(meta["tf"])
+        if pair != active_pair:
+            pair_ticks = ticks[ticks["pair"].str.upper() == pair].sort_values("timestamp").reset_index(drop=True)
+            if pair_ticks.empty:
+                raise SystemExit(f"[tcn3] no ticks loaded for model pair={pair}")
+            bid = pair_ticks["bid"].to_numpy(np.float64)
+            ask = pair_ticks["ask"].to_numpy(np.float64)
+            ts_ns = pair_ticks["timestamp"].to_numpy(dtype="datetime64[ns]").astype("int64").astype(np.int64)
+            active_pair = pair
+            candle_cache = {}
+            prepared_key = None
+            prepared_inputs = None
+        if timeframe not in candle_cache:
+            candle_cache[timeframe] = build_bid_candles(bid, ask, ts_ns, timeframe)
+        candles = candle_cache[timeframe]
 
-        bid = pair_ticks["bid"].to_numpy(np.float64)
-        ask = pair_ticks["ask"].to_numpy(np.float64)
-        ts_ns = pair_ticks["timestamp"].to_numpy(dtype="datetime64[ns]").astype("int64").astype(np.int64)
         model, namespace, point = load_torch_model(path)
         if getattr(namespace, "target", "") != "excursion":
             raise SystemExit(f"[tcn3] wrong target in {path.name}: {getattr(namespace, 'target', '')}")
-        candles = build_bid_candles(bid, ask, ts_ns, str(meta["tf"]))
-        predictions = predict_model(model, namespace, candles, point, device)
+        current_prepared_key = (
+            pair,
+            timeframe,
+            int(namespace.window),
+            str(namespace.feature_set),
+            float(getattr(namespace, "barrier_points", getattr(namespace, "move_scale_points", 100.0))),
+            bool(getattr(namespace, "session_feature", False)),
+            float(point),
+        )
+        cache_hit = current_prepared_key == prepared_key and prepared_inputs is not None
+        if not cache_hit:
+            prepared_inputs = prepare_model_inputs(namespace, candles, point)
+            prepared_key = current_prepared_key
+        predictions = predict_prepared_model(model, namespace, prepared_inputs, device)
         scores = predictions[:, 0].astype(np.float64)
         finite_scores = scores[np.isfinite(scores)]
         if not len(finite_scores):
@@ -212,7 +247,8 @@ def main() -> None:
         combo_done = 0
         print(
             f"[tcn3] model {model_number}/{len(paths)} {path.name} "
-            f"candles={len(candles.ohlc):,} score_range={finite_scores.min():.1f}..{finite_scores.max():.1f} "
+            f"candles={len(candles.ohlc):,} feature_cache={'hit' if cache_hit else 'build'} "
+            f"score_range={finite_scores.min():.1f}..{finite_scores.max():.1f} "
             f"thresholds={thresholds} combos={combo_total:,}",
             flush=True,
         )

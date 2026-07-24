@@ -24,7 +24,7 @@ from forex_ml_barrier_cnn import (
     build_model,
     feature_names,
     make_time_features,
-    make_window_features,
+    make_window_feature_batch,
 )
 from forex_strategy_common import (
     TradeResult,
@@ -63,6 +63,14 @@ class CandleData:
     spread: np.ndarray
     close_tick_idx: np.ndarray
     tick_to_candle: np.ndarray
+
+
+@dataclass
+class PreparedModelInputs:
+    features: np.ndarray
+    extras: np.ndarray
+    candle_indices: np.ndarray
+    candle_count: int
 
 
 def parse_model_name(path: Path) -> dict[str, str | int]:
@@ -143,29 +151,7 @@ def build_bid_candles(bid: np.ndarray, ask: np.ndarray, ts_ns: np.ndarray, timef
     )
 
 
-def _predict_batch(model, device, ns, batch_x, batch_extra, batch_idx, preds) -> None:
-    with torch.no_grad():
-        x = torch.from_numpy(np.stack(batch_x)).to(device)
-        extra = torch.from_numpy(np.stack(batch_extra)).to(device)
-        raw = model(x, extra)
-        if getattr(ns, "target", "") == "move4":
-            p = torch.sigmoid(raw[:, :2])
-            moves = torch.relu(raw[:, 2:]) * float(getattr(ns, "move_scale_points", 100.0))
-            out = torch.cat([p, moves], dim=1).cpu().numpy()
-        elif getattr(ns, "target", "") == "excursion":
-            score = raw.reshape(-1, 1) * float(getattr(ns, "move_scale_points", 100.0))
-            empty = torch.full_like(score, float("nan"))
-            out = torch.cat([score, empty, empty, empty], dim=1).cpu().numpy()
-        else:
-            p_up = torch.sigmoid(raw).reshape(-1, 1)
-            # Single-probability models use pShort = 1 - pLong. Exp fields are
-            # placeholders so probability-only/risk=none simulation remains compatible.
-            huge = torch.full_like(p_up, 1.0e9)
-            out = torch.cat([p_up, 1.0 - p_up, huge, huge], dim=1).cpu().numpy()
-    preds[np.asarray(batch_idx, dtype=np.int64)] = out.astype(np.float32)
-
-
-def predict_model(model, ns, candles: CandleData, point_size: float, device: torch.device) -> np.ndarray:
+def prepare_model_inputs(ns, candles: CandleData, point_size: float) -> PreparedModelInputs:
     window = int(ns.window)
     barrier = float(getattr(ns, "barrier_points", getattr(ns, "move_scale_points", 100.0)))
     session = active_session_allowed(candles.times.astype("int64"), 1).astype(np.float32)
@@ -173,29 +159,81 @@ def predict_model(model, ns, candles: CandleData, point_size: float, device: tor
         times=candles.times,
         ohlc=candles.ohlc,
         spread=candles.spread,
-        labels=np.zeros((len(candles.ohlc), 4), dtype=np.float32),
+        labels=np.zeros(len(candles.ohlc), dtype=np.float32),
         valid=np.ones(len(candles.ohlc), dtype=np.bool_),
         session=session,
         point_size=point_size,
     )
-    time_feat = make_time_features(data.times)
-    preds = np.full((len(candles.ohlc), 4), np.nan, dtype=np.float32)
-    batch_x, batch_extra, batch_idx = [], [], []
-    model = model.to(device)
-    for i in range(window - 1, len(candles.ohlc)):
-        batch_x.append(make_window_features(data, i, window, barrier, ns.feature_set))
-        extra_values = [data.spread[i] / (data.point_size * barrier), *time_feat[i]]
-        if getattr(ns, "session_feature", False):
-            extra_values.insert(1, data.session[i])
-        batch_extra.append(np.asarray(extra_values, dtype=np.float32))
-        batch_idx.append(i)
-        if len(batch_x) >= 2048:
-            _predict_batch(model, device, ns, batch_x, batch_extra, batch_idx, preds)
-            batch_x.clear(); batch_extra.clear(); batch_idx.clear()
-    if batch_x:
-        _predict_batch(model, device, ns, batch_x, batch_extra, batch_idx, preds)
-    return preds
+    candle_indices = np.arange(window - 1, len(candles.ohlc), dtype=np.int64)
+    features = make_window_feature_batch(
+        data,
+        candle_indices,
+        window,
+        barrier,
+        ns.feature_set,
+    )
+    time_features = make_time_features(data.times)[candle_indices]
+    scale = max(data.point_size * barrier, 1e-12)
+    spread_feature = (data.spread[candle_indices] / scale).reshape(-1, 1)
+    if getattr(ns, "session_feature", False):
+        session_feature = data.session[candle_indices].reshape(-1, 1)
+        extras = np.concatenate([spread_feature, session_feature, time_features], axis=1)
+    else:
+        extras = np.concatenate([spread_feature, time_features], axis=1)
+    return PreparedModelInputs(
+        features=np.ascontiguousarray(features, dtype=np.float32),
+        extras=np.ascontiguousarray(extras, dtype=np.float32),
+        candle_indices=candle_indices,
+        candle_count=len(candles.ohlc),
+    )
 
+
+def _format_model_output(raw: torch.Tensor, ns) -> np.ndarray:
+    if getattr(ns, "target", "") == "move4":
+        probability = torch.sigmoid(raw[:, :2])
+        moves = torch.relu(raw[:, 2:]) * float(getattr(ns, "move_scale_points", 100.0))
+        output = torch.cat([probability, moves], dim=1)
+    elif getattr(ns, "target", "") == "excursion":
+        score = raw.reshape(-1, 1) * float(getattr(ns, "move_scale_points", 100.0))
+        empty = torch.full_like(score, float("nan"))
+        output = torch.cat([score, empty, empty, empty], dim=1)
+    else:
+        probability_up = torch.sigmoid(raw).reshape(-1, 1)
+        huge = torch.full_like(probability_up, 1.0e9)
+        output = torch.cat([probability_up, 1.0 - probability_up, huge, huge], dim=1)
+    return output.float().cpu().numpy()
+
+
+def predict_prepared_model(
+    model,
+    ns,
+    prepared: PreparedModelInputs,
+    device: torch.device,
+    batch_size: int = 2048,
+) -> np.ndarray:
+    predictions = np.full((prepared.candle_count, 4), np.nan, dtype=np.float32)
+    model = model.to(device)
+    amp_enabled = device.type == "cuda" and not bool(getattr(ns, "no_amp", False))
+    with torch.inference_mode():
+        for start in range(0, len(prepared.candle_indices), int(batch_size)):
+            stop = min(start + int(batch_size), len(prepared.candle_indices))
+            feature_tensor = torch.from_numpy(prepared.features[start:stop])
+            extra_tensor = torch.from_numpy(prepared.extras[start:stop])
+            if device.type == "cuda":
+                feature_tensor = feature_tensor.pin_memory()
+                extra_tensor = extra_tensor.pin_memory()
+            feature_tensor = feature_tensor.to(device, non_blocking=device.type == "cuda")
+            extra_tensor = extra_tensor.to(device, non_blocking=device.type == "cuda")
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+                raw = model(feature_tensor, extra_tensor)
+            output = _format_model_output(raw, ns)
+            predictions[prepared.candle_indices[start:stop]] = output.astype(np.float32)
+    return predictions
+
+
+def predict_model(model, ns, candles: CandleData, point_size: float, device: torch.device) -> np.ndarray:
+    prepared = prepare_model_inputs(ns, candles, point_size)
+    return predict_prepared_model(model, ns, prepared, device)
 
 def smooth_predictions(preds: np.ndarray, ma: int) -> np.ndarray:
     ma = int(ma)
