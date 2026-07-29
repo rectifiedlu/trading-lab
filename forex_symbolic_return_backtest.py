@@ -103,6 +103,9 @@ if njit is not None:
                 if entry_tick >= len(bid):
                     break
                 candle_i = int(tick_to_candle[entry_tick])
+                if not entry_allowed[candle_i]:
+                    candle_i += 1
+                    continue
                 if side == 1 and block_long:
                     candle_i += 1
                     continue
