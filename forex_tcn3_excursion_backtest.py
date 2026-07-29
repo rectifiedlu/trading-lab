@@ -21,6 +21,7 @@ from forex_ml_tick_simulator import (
     predict_prepared_model,
     prepare_model_inputs,
 )
+from forex_result_rankings import TopResultTracker, print_top_result_sections
 from forex_strategy_common import (
     active_session_allowed,
     build_parser,
@@ -28,7 +29,6 @@ from forex_strategy_common import (
     load_market,
     parse_num_list,
     parse_str_list,
-    write_results,
 )
 from forex_symbolic_return_backtest import (
     append_symbolic_csv,
@@ -38,6 +38,7 @@ from forex_symbolic_return_backtest import (
     parse_exit_modes,
     parse_pair_num_list,
     simulate_one,
+    write_symbolic_csv,
 )
 
 
@@ -94,7 +95,7 @@ def main() -> None:
     ap.add_argument("--horizons", default=None)
     ap.add_argument("--allow-incomplete-model-grid", action="store_true")
     ap.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    ap.add_argument("--keep-in-memory", action="store_true", help="retain rows for sorted console sections")
+    ap.add_argument("--keep-in-memory", action="store_true", help="keep all rows in RAM to sort the output CSV; final top rankings are always printed")
     args = ap.parse_args()
 
     requested_pairs = {str(pair).upper() for pair in args.pairs}
@@ -168,6 +169,7 @@ def main() -> None:
         print(f"[tcn3] overwrite out={out_path}", flush=True)
 
     kept_results = []
+    rankings = TopResultTracker(args.top)
     total_rows = 0
     overall_start = time.time()
     print(
@@ -300,6 +302,7 @@ def main() -> None:
                                     )
                                     if result.trades >= args.min_trades:
                                         rows.append(result)
+                                        rankings.add(result)
                                         total_rows += 1
                                         if args.keep_in_memory:
                                             kept_results.append(result)
@@ -316,7 +319,8 @@ def main() -> None:
     if total_rows == 0:
         raise SystemExit("no TCN3 results survived --min-trades")
     if args.keep_in_memory:
-        write_results(args.out, kept_results, args.top, args.sort_by)
+        write_symbolic_csv(args.out, kept_results)
+    print_top_result_sections(rankings)
     print(
         f"[tcn3] wrote {args.out} rows={total_rows:,} "
         f"models={len(paths):,} elapsed={time.time() - overall_start:.1f}s",

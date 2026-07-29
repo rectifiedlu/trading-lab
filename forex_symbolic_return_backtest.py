@@ -11,8 +11,9 @@ from pathlib import Path
 
 import numpy as np
 
+from forex_result_rankings import TopResultTracker, print_top_result_sections
 from forex_signal_sweep_common import build_bid_ohlc
-from forex_strategy_common import TradeResult, active_session_allowed, build_parser, default_point_size, load_market, parse_num_list, parse_str_list, print_ranked_sections
+from forex_strategy_common import TradeResult, active_session_allowed, build_parser, default_point_size, load_market, parse_num_list, parse_str_list
 
 try:
     from numba import njit
@@ -436,7 +437,7 @@ def main() -> None:
     ap.add_argument("--horizons", default=None, help="filter and audit model horizons")
     ap.add_argument("--allow-incomplete-model-grid", action="store_true")
     ap.add_argument("--include-expression", action="store_true", help="repeat full symbolic expression in every result row; off by default to avoid huge memory/CSV bloat")
-    ap.add_argument("--keep-in-memory", action="store_true", help="keep all rows in RAM for sorted final console output; off by default for long sweeps")
+    ap.add_argument("--keep-in-memory", action="store_true", help="keep all rows in RAM to sort the output CSV; final top rankings are always printed")
     args = ap.parse_args()
 
     ticks, _ = load_market(args)
@@ -531,6 +532,7 @@ def main() -> None:
     tp_modes = parse_exit_modes(args.tp_modes, ["fixed", "fixed_signal", "opposite", "neutral"])
     sl_modes = parse_exit_modes(args.sl_modes, ["fixed", "fixed_signal", "opposite", "neutral"])
     results: list[TradeResult] = []
+    rankings = TopResultTracker(args.top)
     total_rows = 0
     t0 = time.time()
     checkpoint_out = args.out + ".checkpoint.csv"
@@ -603,6 +605,7 @@ def main() -> None:
                                     if args.keep_in_memory:
                                         results.append(r)
                                     pending_checkpoint_rows.append(r)
+                                    rankings.add(r)
                                     model_rows += 1
                                     total_rows += 1
                                 combo_done += 1
@@ -625,10 +628,10 @@ def main() -> None:
     if args.keep_in_memory:
         filtered = [r for r in results if r.trades >= args.min_trades]
         write_symbolic_csv(args.out, filtered)
-        print_ranked_sections(filtered, args.top)
         final_rows = len(filtered)
     else:
         final_rows = total_rows
+    print_top_result_sections(rankings)
     print(f"[symbt] wrote {args.out} rows={final_rows:,} elapsed={time.time() - t0:.1f}s", flush=True)
 
 
