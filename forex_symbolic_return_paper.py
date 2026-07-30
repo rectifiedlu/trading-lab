@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
+from forex_score_reset import DirectionalScoreReset
 from forex_signal_paper_common import (
     find_position,
     point_size,
@@ -87,23 +88,23 @@ def current_move_points(mt5, args, pos) -> float | None:
     return (entry - float(tick.ask)) / ps
 
 
-def close_fixed_if_needed(mt5, args) -> bool:
+def close_fixed_if_needed(mt5, args) -> int:
+    """Close a fixed TP/SL and return the exited side, or zero."""
     pos = find_position(mt5, args.symbol, args.magic)
     if pos is None:
-        return False
+        return 0
     move = current_move_points(mt5, args, pos)
     if move is None:
-        return False
+        return 0
     side = 1 if int(pos.type) == mt5.POSITION_TYPE_BUY else -1
     close_side = "sell" if side == 1 else "buy"
     if args.tp_mode in {"fixed", "fixed_signal"} and args.tp_points > 0 and move >= args.tp_points:
-        send_order(mt5, args, close_side, "tp_fixed", int(pos.ticket), tag=TAG)
-        return True
+        result = send_order(mt5, args, close_side, "tp_fixed", int(pos.ticket), tag=TAG)
+        return side if result is not None else 0
     if args.sl_mode in {"fixed", "fixed_signal"} and args.sl_points > 0 and move <= -args.sl_points:
-        send_order(mt5, args, close_side, "sl_fixed", int(pos.ticket), tag=TAG)
-        return True
-    return False
-
+        result = send_order(mt5, args, close_side, "sl_fixed", int(pos.ticket), tag=TAG)
+        return side if result is not None else 0
+    return 0
 
 
 def position_text(mt5, args, pos) -> str:
@@ -159,11 +160,12 @@ def main() -> None:
     last_score: float | None = None
     last_signal = 0
     last_session_ok: bool | None = None
+    reset = DirectionalScoreReset()
     print(
         f"[{TAG}-paper] start symbol={args.symbol} tf={args.timeframe} window={window} "
         f"horizon={meta['horizon']} session={meta['session']} threshold={args.threshold:g} mode={args.mode} "
         f"tp={args.tp_mode}:{args.tp_points:g} sl={args.sl_mode}:{args.sl_points:g} "
-        f"model={model_path.name} dry={int(args.dry_run)}",
+        f"model={model_path.name} reset=mandatory dry={int(args.dry_run)}",
         flush=True,
     )
     print(
@@ -180,12 +182,16 @@ def main() -> None:
                 time.sleep(args.poll)
                 continue
             closed_new_bar = candles.update(tick)
-            close_fixed_if_needed(mt5, args)
+            fixed_exit_side = close_fixed_if_needed(mt5, args)
+            if fixed_exit_side != 0:
+                reset.mark_fixed_exit(fixed_exit_side)
+                print(f"[{TAG}-paper] {reset.text()} after fixed exit", flush=True)
 
             if closed_new_bar and candles.last_closed_bucket != last_bar:
                 last_bar = candles.last_closed_bucket
                 score = score_closed_candles(model, candles, window)
                 signal = signal_from_score(score, args.threshold, args.mode)
+                reset.observe(signal)
                 session_ok = entry_allowed(meta, last_bar, candles.tf_sec)
                 last_score = score
                 last_signal = signal
@@ -196,7 +202,7 @@ def main() -> None:
                 print(
                     f"[{TAG}-paper] BAR bucket={last_bar} O={candle.open:.5f} H={candle.high:.5f} L={candle.low:.5f} C={candle.close:.5f} | "
                     f"score={score if score is not None else float('nan'):+.3f} threshold=+/-{args.threshold:g} signal={signal_text} "
-                    f"mode={args.mode} session={meta['session']} entry_ok={int(session_ok)} pos={position_text(mt5, args, pos)}",
+                    f"mode={args.mode} session={meta['session']} entry_ok={int(session_ok)} pos={position_text(mt5, args, pos)} {reset.text()}",
                     flush=True,
                 )
 
@@ -208,10 +214,21 @@ def main() -> None:
                         if should_signal_exit(exit_mode, side, signal):
                             close_side = "sell" if side == 1 else "buy"
                             print(f"[{TAG}-paper] signal exit mode={exit_mode} move={move:+.1f}pt", flush=True)
-                            send_order(mt5, args, close_side, f"exit_{exit_mode}", int(pos.ticket), tag=TAG)
+                            result = send_order(mt5, args, close_side, f"exit_{exit_mode}", int(pos.ticket), tag=TAG)
+                            if result is not None and signal == -side:
+                                if not session_ok:
+                                    print(f"[{TAG}-paper] reverse entry blocked by session", flush=True)
+                                elif reset.blocks(signal):
+                                    print(f"[{TAG}-paper] reverse entry blocked by {reset.text()}", flush=True)
+                                elif not side_allowed(args, signal):
+                                    print(f"[{TAG}-paper] reverse entry blocked by side filter", flush=True)
+                                else:
+                                    send_order(mt5, args, "buy" if signal == 1 else "sell", f"reverse_{exit_mode}", tag=TAG)
                 elif signal != 0:
                     if not session_ok:
                         print(f"[{TAG}-paper] entry blocked by session", flush=True)
+                    elif reset.blocks(signal):
+                        print(f"[{TAG}-paper] entry blocked by {reset.text()}", flush=True)
                     elif not side_allowed(args, signal):
                         print(f"[{TAG}-paper] entry blocked by side filter", flush=True)
                     else:
@@ -228,7 +245,7 @@ def main() -> None:
                     pos_text = f"{side} entry={float(pos.price_open):.5f} move={move if move is not None else float('nan'):+.1f}pt"
                 signal_text = "LONG" if last_signal == 1 else ("SHORT" if last_signal == -1 else "NEUTRAL")
                 model_text = (
-                    f"score={last_score:+.3f} signal={signal_text} session_ok={int(last_session_ok)}"
+                    f"score={last_score:+.3f} signal={signal_text} session_ok={int(last_session_ok)} {reset.text()}"
                     if last_score is not None and last_session_ok is not None
                     else "score=waiting signal=NEUTRAL session_ok=?"
                 )
