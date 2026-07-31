@@ -31,11 +31,17 @@ def parse_dt(value: str | None, fallback: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def load_mt5_ticks_range(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+def load_mt5_ticks_range(
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    chunk_days: float | None = None,
+) -> pd.DataFrame:
     """Load bid/ask ticks directly from the currently configured MT5 terminal."""
     if not mt5.initialize():
         raise SystemExit(f"mt5.initialize failed: {mt5.last_error()}")
 
+    frames: list[pd.DataFrame] = []
     try:
         info = mt5.symbol_info(symbol)
         if info is None:
@@ -48,18 +54,59 @@ def load_mt5_ticks_range(symbol: str, start: datetime, end: datetime) -> pd.Data
             f"digits={info.digits} point={info.point} spread={info.spread}",
             flush=True,
         )
-        ticks = mt5.copy_ticks_range(symbol, start, end, mt5.COPY_TICKS_ALL)
-        if ticks is None:
-            raise SystemExit(f"copy_ticks_range failed: {mt5.last_error()}")
+        if chunk_days is None:
+            ticks = mt5.copy_ticks_range(symbol, start, end, mt5.COPY_TICKS_ALL)
+            if ticks is None:
+                raise SystemExit(f"copy_ticks_range failed: {mt5.last_error()}")
+            frames.append(pd.DataFrame(ticks))
+        else:
+            chunk = timedelta(days=max(float(chunk_days), 1.0 / 24.0))
+            cursor = end
+            part_no = 0
+            total = 0
+            empty_streak = 0
+            while cursor > start:
+                chunk_start = max(cursor - chunk, start)
+                ticks = mt5.copy_ticks_range(
+                    symbol, chunk_start, cursor, mt5.COPY_TICKS_ALL
+                )
+                if ticks is None:
+                    raise SystemExit(
+                        f"copy_ticks_range failed for {symbol} "
+                        f"{chunk_start.isoformat()} -> {cursor.isoformat()}: {mt5.last_error()}"
+                    )
+                if len(ticks):
+                    frames.append(pd.DataFrame(ticks))
+                    total += len(ticks)
+                    empty_streak = 0
+                else:
+                    empty_streak += 1
+                part_no += 1
+                if part_no % 10 == 0 or empty_streak >= 3:
+                    print(
+                        f"[mt5-dump] {symbol} max-history chunks={part_no:,} "
+                        f"ticks={total:,} back_to={chunk_start.isoformat()} "
+                        f"empty_streak={empty_streak}",
+                        flush=True,
+                    )
+                cursor = chunk_start
+                if empty_streak >= 3:
+                    break
     finally:
         mt5.shutdown()
 
-    df = pd.DataFrame(ticks)
+    if not frames:
+        return pd.DataFrame(columns=["timestamp", "pair", "bid", "ask"])
+    df = pd.concat(frames, ignore_index=True)
     if df.empty:
         return pd.DataFrame(columns=["timestamp", "pair", "bid", "ask"])
     if "time_msc" not in df.columns:
         raise SystemExit(f"[mt5-dump] unexpected columns: {list(df.columns)}")
 
+    start_ms = int(start.timestamp() * 1000)
+    end_ms = int(end.timestamp() * 1000)
+    df = df[(df["time_msc"] >= start_ms) & (df["time_msc"] < end_ms)]
+    df = df.drop_duplicates().sort_values("time_msc")
     df = df[(df["bid"] > 0) & (df["ask"] > 0) & (df["ask"] >= df["bid"])].copy()
     if df.empty:
         return pd.DataFrame(columns=["timestamp", "pair", "bid", "ask"])
@@ -70,7 +117,7 @@ def load_mt5_ticks_range(symbol: str, start: datetime, end: datetime) -> pd.Data
         "ask": df["ask"].astype(float),
         "pair": symbol.upper(),
     })
-    return out[["timestamp", "pair", "bid", "ask"]].sort_values("timestamp").reset_index(drop=True)
+    return out[["timestamp", "pair", "bid", "ask"]].reset_index(drop=True)
 
 
 def main() -> None:

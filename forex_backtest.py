@@ -540,7 +540,10 @@ def load_ticks(args) -> pd.DataFrame:
         end = _parse_datetime(args.to)
         frames = [
             frame for pair in args.pairs
-            for frame in [load_mt5_ticks_range(pair, start, end)]
+            for frame in [load_mt5_ticks_range(
+                pair, start, end,
+                chunk_days=7.0 if getattr(args, "max_history", False) else None,
+            )]
             if not frame.empty
         ]
         ticks = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
