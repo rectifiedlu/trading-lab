@@ -121,13 +121,15 @@ def apply_date_window(args: argparse.Namespace) -> None:
     end = pd.Timestamp.utcnow().floor("D")
     days_value = str(args.days).strip().lower()
     if days_value in {"max", "all"}:
-        # MT5 returns only locally/broker-available history; this is just a broad request.
-        start = pd.Timestamp("2000-01-01", tz="UTC")
+        args.max_history = True
+        start = pd.Timestamp("1970-01-01", tz="UTC")
+        end = pd.Timestamp.now(tz="UTC")
     else:
+        args.max_history = False
         days = max(1.0, float(args.days))
         start = end - pd.Timedelta(days=days)
-    args.start = args.start or start.date().isoformat()
-    args.to = args.to or end.date().isoformat()
+    args.start = args.start or start.isoformat()
+    args.to = args.to or end.isoformat()
 
 
 def set_seed(seed: int) -> None:
@@ -197,23 +199,48 @@ def load_native_mt5_ohlc(args: argparse.Namespace, point_size: float) -> pd.Data
             flush=True,
         )
         chunks = []
-        chunk_days = max(float(getattr(args, "native_chunk_days", 30.0)), 1.0)
-        cur = pd.Timestamp(start).to_pydatetime()
-        while cur < end:
-            nxt = min((pd.Timestamp(cur) + pd.Timedelta(days=chunk_days)).to_pydatetime(), end)
-            rates_part = mt5.copy_rates_range(args.pair, tf, cur, nxt)
-            if rates_part is None:
-                err = mt5.last_error()
-                print(f"[ml] native_ohlc chunk failed {cur.isoformat()} -> {nxt.isoformat()} err={err}", flush=True)
-            elif len(rates_part):
+        if getattr(args, "max_history", False):
+            chunk_bars = max(int(getattr(args, "native_chunk_bars", 500_000)), 1)
+            start_pos = 0
+            while True:
+                rates_part = mt5.copy_rates_from_pos(args.pair, tf, start_pos, chunk_bars)
+                if rates_part is None:
+                    raise SystemExit(
+                        f"copy_rates_from_pos failed pair={args.pair} tf={tf_name} "
+                        f"start_pos={start_pos}: {mt5.last_error()}"
+                    )
+                count = len(rates_part)
+                if not count:
+                    break
                 chunks.append(pd.DataFrame(rates_part))
-            cur = nxt
+                start_pos += count
+                print(
+                    f"[ml] native_ohlc max pair={args.pair} tf={tf_name} bars={start_pos:,}",
+                    flush=True,
+                )
+                if count < chunk_bars:
+                    break
+        else:
+            chunk_days = max(float(getattr(args, "native_chunk_days", 30.0)), 1.0)
+            cur = pd.Timestamp(start).to_pydatetime()
+            while cur < end:
+                nxt = min((pd.Timestamp(cur) + pd.Timedelta(days=chunk_days)).to_pydatetime(), end)
+                rates_part = mt5.copy_rates_range(args.pair, tf, cur, nxt)
+                if rates_part is None:
+                    err = mt5.last_error()
+                    print(f"[ml] native_ohlc chunk failed {cur.isoformat()} -> {nxt.isoformat()} err={err}", flush=True)
+                elif len(rates_part):
+                    chunks.append(pd.DataFrame(rates_part))
+                cur = nxt
         if not chunks:
-            raise SystemExit(f"copy_rates_range failed/no chunks: {mt5.last_error()}")
+            raise SystemExit(f"MT5 returned no native OHLC chunks: {mt5.last_error()}")
     finally:
         mt5.shutdown()
 
     raw = pd.concat(chunks, ignore_index=True).drop_duplicates(subset=["time"]).sort_values("time")
+    start_epoch = int(pd.Timestamp(start).timestamp())
+    end_epoch = int(pd.Timestamp(end).timestamp())
+    raw = raw[(raw["time"] >= start_epoch) & (raw["time"] < end_epoch)]
     if raw.empty:
         raise SystemExit("[ml] native_ohlc returned no bars")
     out = pd.DataFrame({
@@ -760,7 +787,10 @@ def make_window_feature_batch(
     ]).astype(np.float32)
 
 
-def load_barrier_data(args: argparse.Namespace) -> BarrierData:
+def load_barrier_data(
+    args: argparse.Namespace,
+    cached_ticks: pd.DataFrame | None = None,
+) -> BarrierData:
     point_size = float(args.point_size or default_point_size(args.pair))
     if args.ohlc_source == "native":
         candles = load_native_mt5_ohlc(args, point_size)
@@ -770,10 +800,12 @@ def load_barrier_data(args: argparse.Namespace) -> BarrierData:
             flush=True,
         )
     else:
-        ticks, _ = load_market(args)
-        if ticks["pair"].nunique() > 1:
-            ticks = ticks[ticks["pair"] == args.pair]
-        ticks = ticks.sort_values("timestamp").reset_index(drop=True)
+        ticks = cached_ticks
+        if ticks is None:
+            ticks, _ = load_market(args)
+            if ticks["pair"].nunique() > 1:
+                ticks = ticks[ticks["pair"] == args.pair]
+            ticks = ticks.sort_values("timestamp").reset_index(drop=True)
         print(
             f"[ml] tick_range={ticks['timestamp'].iloc[0]} -> {ticks['timestamp'].iloc[-1]} "
             f"ticks={len(ticks):,}",
@@ -1698,10 +1730,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="ticks = build bid candles from ticks; native = use MT5 copy_rates_range candles")
     ap.add_argument("--native-chunk-days", type=float, default=30.0,
                     help="chunk size for MT5 native OHLC downloads")
+    ap.add_argument("--native-chunk-bars", type=int, default=500_000,
+                    help="bars per MT5 request when --days max is used with native OHLC")
     ap.add_argument("--csv", default=None)
     ap.add_argument("--pair", default="XAUUSD")
     ap.add_argument("--pairs", nargs="+", default=None)
-    ap.add_argument("--days", default="90", help="lookback days or 'max' for all MT5-available native OHLC")
+    ap.add_argument("--days", default="90", help="lookback days or 'max' for all history available from the selected source")
     ap.add_argument("--hours", type=float, default=None)
     ap.add_argument("--from", dest="start", default=None)
     ap.add_argument("--to", default=None)
@@ -2062,10 +2096,16 @@ def main() -> None:
             f"eval_sl={parse_num_list(pair_args.eval_sl_points, default_eval_sl_for_pair(pair))}",
             flush=True,
         )
+        cached_ticks = None
+        if pair_args.ohlc_source == "ticks":
+            cached_ticks, _ = load_market(pair_args)
+            if cached_ticks["pair"].nunique() > 1:
+                cached_ticks = cached_ticks[cached_ticks["pair"] == pair]
+            cached_ticks = cached_ticks.sort_values("timestamp").reset_index(drop=True)
         for tf in timeframes:
             tf_args = copy(pair_args)
             tf_args.timeframe = tf
-            data = load_barrier_data(tf_args)
+            data = load_barrier_data(tf_args, cached_ticks)
             for label_tp, label_sl, label_session in pair_label_grids[pair]:
                 for model_name in models:
                     for window in windows:

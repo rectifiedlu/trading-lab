@@ -554,7 +554,8 @@ def build_parser(description: str, default_out_name: str) -> argparse.ArgumentPa
     ap.add_argument("--pair", help="pair for local CSV if no pair column exists")
     ap.add_argument("--pairs", nargs="+", default=DEFAULT_PAIRS)
     ap.add_argument("--hours", type=int, default=24)
-    ap.add_argument("--days", type=int, default=None)
+    ap.add_argument("--days", default=None,
+                    help="full UTC day lookback, or 'max'/'all' for all available history")
     ap.add_argument("--from", dest="start", default=None)
     ap.add_argument("--to", default=None)
     ap.add_argument("--side", choices=["long", "short", "both"], default="both")
@@ -585,9 +586,17 @@ def prepare_args(args) -> None:
         args.pairs = pairs or list(DEFAULT_PAIRS)
     if args.source == "local" and not args.csv:
         raise SystemExit("--csv is required for --source local")
+    days_value = str(args.days).strip().lower() if args.days is not None else ""
+    max_history = days_value in {"max", "all"} or bool(getattr(args, "max_history", False))
+    args.max_history = max_history
+    if max_history and args.source == "dukascopy":
+        raise SystemExit("--days max is not supported for Dukascopy downloads; pass an explicit --days value")
     if args.start is None or args.to is None:
-        if args.days is not None:
-            args.start, args.to = _default_date_window(args.days)
+        if max_history:
+            args.start = args.start or "1970-01-01"
+            args.to = args.to or pd.Timestamp.now(tz="UTC").isoformat()
+        elif args.days is not None:
+            args.start, args.to = _default_date_window(float(args.days))
         else:
             args.start, args.to = _default_hour_window(args.hours)
     start_ts = pd.to_datetime(args.start, utc=True, format="mixed")
@@ -1215,6 +1224,7 @@ def write_results(path: str, results: list[TradeResult], top: int, sort_by: str 
 
 
 def load_market(args):
+    global BACKTEST_WINDOW_DAYS
     prepare_args(args)
     print(
         f"[pine] source={args.source} from={args.start} to={args.to} "
@@ -1229,4 +1239,13 @@ def load_market(args):
     ticks = ticks[(ticks["timestamp"] >= start_ts) & (ticks["timestamp"] < end_ts)]
     if ticks.empty:
         raise SystemExit("no ticks loaded")
+    if getattr(args, "max_history", False):
+        first = ticks["timestamp"].min()
+        last = ticks["timestamp"].max()
+        BACKTEST_WINDOW_DAYS = max((last - first).total_seconds() / 86400.0, 1.0 / 86400.0)
+        ranges = ", ".join(
+            f"{pair}={group['timestamp'].min().isoformat()}..{group['timestamp'].max().isoformat()}"
+            for pair, group in ticks.groupby("pair", sort=False)
+        )
+        print(f"[load] maximum available ranges {ranges}", flush=True)
     return ticks, t0
