@@ -235,7 +235,8 @@ def main() -> None:
     ap.add_argument("--out-dir", default=os.path.join("data", "forex", "symbolic_models"))
     ap.add_argument("--train-frac", type=float, default=0.70)
     ap.add_argument("--train-only", action="store_true", help="fit on all available samples; no held-out test split")
-    ap.add_argument("--max-samples", type=int, default=50000)
+    ap.add_argument("--max-samples", type=int, default=0,
+                    help="maximum labelled samples per model; 0 uses all available samples")
     ap.add_argument("--min-samples", type=int, default=100)
     ap.add_argument("--population", type=int, default=1200)
     ap.add_argument("--generations", type=int, default=40)
