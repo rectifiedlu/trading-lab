@@ -1,9 +1,9 @@
 """Train symbolic future-return formulas from raw lagged OHLC.
 
 Artifact scope is one pair/session/timeframe/window/horizon. Inputs are raw
-OHLC lags only: o0,h0,l0,c0,o1,h1,l1,c1,... Target is the signed dominant
-future excursion in points over candles t+1 through t+horizon. It is positive
-when the largest excursion is upward and negative when it is downward.
+OHLC lags only: o0,h0,l0,c0,o1,h1,l1,c1,... Target is the net future
+excursion in points over candles t+1 through t+horizon: maximum upward
+excursion minus maximum downward excursion, both measured from the current close.
 """
 from __future__ import annotations
 
@@ -73,9 +73,9 @@ if njit is not None:
                     future_high = high[j]
                 if low[j] < future_low:
                     future_low = low[j]
-            up_points = (future_high - close[i]) / point_size
-            down_points = (close[i] - future_low) / point_size
-            y[row] = up_points if up_points >= down_points else -down_points
+            up_points = max((future_high - close[i]) / point_size, 0.0)
+            down_points = max((close[i] - future_low) / point_size, 0.0)
+            y[row] = up_points - down_points
             row += 1
         return x, y
 
@@ -95,9 +95,9 @@ def build_lagged(open_, high, low, close, valid, window: int, horizon: int, poin
         rows.append(row)
         future_high = np.max(high[i + 1:i + horizon + 1])
         future_low = np.min(low[i + 1:i + horizon + 1])
-        up_points = (future_high - close[i]) / point_size
-        down_points = (close[i] - future_low) / point_size
-        targets.append(up_points if up_points >= down_points else -down_points)
+        up_points = max((future_high - close[i]) / point_size, 0.0)
+        down_points = max((close[i] - future_low) / point_size, 0.0)
+        targets.append(up_points - down_points)
     return np.asarray(rows, dtype=np.float64), np.asarray(targets, dtype=np.float64)
 
 
@@ -356,7 +356,7 @@ def main() -> None:
                             "pair": pair, "session": int(sess), "timeframe": tf, "window": int(window),
                             "horizon": int(horizon), "point_size": point, "backend": args.backend,
                             "model_path": str(model_path), "feature_names": names,
-                            "target": "signed_dominant_future_excursion_points",
+                            "target": "signed_net_future_excursion_points_v1",
                             "expression": expr, "samples": int(len(y)), "train": train_stats, "test": test_stats,
                             "fit_seconds": round(time.time() - fit_start, 3),
                         }

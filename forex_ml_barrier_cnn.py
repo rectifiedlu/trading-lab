@@ -44,6 +44,7 @@ GOLD_EVAL_TP = [0, 50, 100, 150, 200, 250, 300, 400]
 GOLD_EVAL_SL = [0, 50, 100, 150, 200, 250, 300, 400]
 FX_EVAL_TP = [0, 10, 20, 30, 40, 50, 65, 80, 95]
 FX_EVAL_SL = [0, 10, 20, 30, 40, 50, 65, 80, 95]
+EXCURSION_LABEL = "signed_net_future_excursion_points_v1"
 
 MT5_TIMEFRAMES = {
     "1m": "TIMEFRAME_M1",
@@ -431,7 +432,7 @@ def label_excursion(
     point_size: float,
     scale_points: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Signed dominant future excursion, scaled for regression training."""
+    """Net upward-minus-downward future excursion, scaled for regression training."""
     if njit is not None:
         return _label_excursion_numba(close, high, low, horizon, point_size, scale_points)
     labels = np.zeros(len(close), dtype=np.float32)
@@ -441,9 +442,9 @@ def label_excursion(
     for i in range(max(stop, 0)):
         future_high = np.max(high[i + 1:i + horizon + 1])
         future_low = np.min(low[i + 1:i + horizon + 1])
-        up_points = (future_high - close[i]) / point_size
-        down_points = (close[i] - future_low) / point_size
-        score = up_points if up_points >= down_points else -down_points
+        up_points = max((future_high - close[i]) / point_size, 0.0)
+        down_points = max((close[i] - future_low) / point_size, 0.0)
+        score = up_points - down_points
         labels[i] = np.float32(score / scale)
         valid[i] = True
     return labels, valid
@@ -472,8 +473,12 @@ if njit is not None:
                 if low[j] < future_low:
                     future_low = low[j]
             up_points = (future_high - close[i]) / point_size
+            if up_points < 0.0:
+                up_points = 0.0
             down_points = (close[i] - future_low) / point_size
-            score = up_points if up_points >= down_points else -down_points
+            if down_points < 0.0:
+                down_points = 0.0
+            score = up_points - down_points
             labels[i] = np.float32(score / scale)
             valid[i] = True
         return labels, valid
@@ -1744,7 +1749,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--timeframes", default=",".join(DEFAULT_TIMEFRAMES),
                     help="comma list of timeframes to sweep")
     ap.add_argument("--target", choices=["barrier", "trade", "tpsl_direction", "move4", "nextbar", "excursion"], default="move4",
-                    help="barrier = equal up/down first; trade = side-specific win label; tpsl_direction = fixed TP/SL direction; move4 = long/short prob + max up/down forecast; nextbar = future close up probability; excursion = signed dominant future excursion")
+                    help="barrier = equal up/down first; trade = side-specific win label; tpsl_direction = fixed TP/SL direction; move4 = long/short prob + max up/down forecast; nextbar = future close up probability; excursion = max-up minus max-down future excursion")
     ap.add_argument("--trade-side", choices=["long", "short"], default="long",
                     help="side to label when --target trade")
     ap.add_argument("--model", choices=["cnn", "tcn", "tcn2", "tcn3", "mlp", "linear", "gru", "lstm", "transformer", "rf", "xgb"], default="tcn")
@@ -1826,6 +1831,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="external session filter sweep for probability signals")
     ap.add_argument("--prob-ma", default="1,3,5,10",
                     help="comma list of probability moving-average lengths for external signal eval")
+    ap.add_argument("--model-dir", default=os.path.join("data", "forex", "ml_models"),
+                    help="directory for automatically named sweep models")
     ap.add_argument("--model-out", default=None)
     ap.add_argument("--pred-out", default="",
                     help="optional prediction CSV path; empty disables prediction CSV export")
@@ -1842,6 +1849,8 @@ def build_parser() -> argparse.ArgumentParser:
 def run_one(args: argparse.Namespace, data: BarrierData) -> bool:
     if args.target == "excursion" and not args.train_only:
         raise SystemExit("--target excursion trains models only; use --train-only and forex_tcn3_excursion_backtest.py")
+    if args.target == "excursion":
+        args.excursion_label = EXCURSION_LABEL
     if args.target == "move4":
         label_tag = f"scale{float(args.move_scale_points):g}"
         side_tag = "both"
@@ -1860,7 +1869,7 @@ def run_one(args: argparse.Namespace, data: BarrierData) -> bool:
     if args.model_out is None:
         ext = "pkl" if args.model in {"rf", "xgb"} else "pt"
         args.model_out = os.path.join(
-            "data", "forex", "ml_models",
+            args.model_dir,
             f"forex_ml_{args.pair}_{args.target}_{side_tag}_{args.model}_{args.feature_set}_"
             f"tf{args.timeframe}_"
             f"{label_tag}_"

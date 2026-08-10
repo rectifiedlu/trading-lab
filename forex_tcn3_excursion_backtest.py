@@ -1,7 +1,8 @@
 """Tick backtest for TCN3 signed-excursion regression models.
 
-TCN3 predicts one score in points: the signed dominant excursion over the
-training horizon. Positive scores signal long, negative scores signal short.
+TCN3 predicts one score in points: maximum upward excursion minus maximum
+downward excursion over the training horizon. Positive scores signal long,
+negative scores signal short.
 There is no probability conversion or moving-average smoothing.
 """
 from __future__ import annotations
@@ -207,6 +208,13 @@ def main() -> None:
         model, namespace, point = load_torch_model(path)
         if getattr(namespace, "target", "") != "excursion":
             raise SystemExit(f"[tcn3] wrong target in {path.name}: {getattr(namespace, 'target', '')}")
+        expected_label = "signed_net_future_excursion_points_v1"
+        actual_label = str(getattr(namespace, "excursion_label", ""))
+        if actual_label != expected_label:
+            raise SystemExit(
+                f"[tcn3] incompatible excursion label in {path.name}: "
+                f"{actual_label or 'legacy/unknown'}; retrain with {expected_label}"
+            )
         current_prepared_key = (
             pair,
             timeframe,

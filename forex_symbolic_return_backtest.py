@@ -459,11 +459,12 @@ def main() -> None:
                 skipped_meta += 1
                 continue
             pair_ok = str(meta_probe["pair"]).upper() in requested_pairs
+            target_ok = str(meta_probe.get("target", "")) == "signed_net_future_excursion_points_v1"
             tf_ok = requested_timeframes is None or str(meta_probe.get("timeframe", "")).strip().lower() in requested_timeframes
             session_ok = requested_sessions is None or int(meta_probe.get("session", -999)) in requested_sessions
             window_ok = requested_windows is None or int(meta_probe.get("window", -1)) in requested_windows
             horizon_ok = requested_horizons is None or int(meta_probe.get("horizon", -1)) in requested_horizons
-            if pair_ok and tf_ok and session_ok and window_ok and horizon_ok:
+            if pair_ok and target_ok and tf_ok and session_ok and window_ok and horizon_ok:
                 paths.append(path)
         except Exception:
             skipped_meta += 1
