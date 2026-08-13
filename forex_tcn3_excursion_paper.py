@@ -2,13 +2,14 @@
 
 The model emits one score in points. This trader mirrors the TCN3 backtest:
 thresholded normal/invert signals, independent TP/SL modes, tick-based fixed
-exits, candle-close signal exits, session-gated entries, and mandatory
-same-side reset after a fixed exit.
+and score exits, candle-close signal exits, session-gated entries, and
+mandatory same-side reset after a price-triggered exit.
 """
 from __future__ import annotations
 
 import argparse
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -22,9 +23,18 @@ from forex_signal_paper_common import find_position, point_size, send_order
 from forex_strategy_common import active_session_allowed, timeframe_to_ns
 
 
-EXIT_MODES = {"opposite", "neutral", "fixed", "fixed_signal"}
+EXIT_MODES = {"opposite", "neutral", "fixed", "fixed_signal", "score1", "score2"}
 EXPECTED_LABEL = "signed_net_future_excursion_points_v1"
 TAG = "tcn3"
+
+
+@dataclass
+class ScoreBracket:
+    ticket: int
+    side: int
+    tp_level: float
+    sl_level: float
+    distance: float
 
 
 def signal_name(side: int) -> str:
@@ -160,25 +170,84 @@ def current_move_points(mt5, args, pos) -> float | None:
     return (float(pos.price_open) - float(tick.ask)) / point
 
 
-def fixed_exit_if_needed(mt5, args) -> int:
+def make_score_bracket(mt5, args, pos, score: float | None, anchor: float | None = None) -> ScoreBracket | None:
+    if args.tp_mode not in {"score1", "score2"} and args.sl_mode not in {"score1", "score2"}:
+        return None
+    if score is None or not np.isfinite(score) or abs(score) <= 0.0:
+        return None
+    side = 1 if int(pos.type) == mt5.POSITION_TYPE_BUY else -1
+    reference = float(pos.price_open) if anchor is None else float(anchor)
+    distance = abs(float(score))
+    delta = distance * point_size(mt5, args.symbol)
+    bracket = ScoreBracket(
+        ticket=int(pos.ticket),
+        side=side,
+        tp_level=reference + side * delta,
+        sl_level=reference - side * delta,
+        distance=distance,
+    )
+    print(
+        f"[{TAG}-paper] score bracket ticket={bracket.ticket} mode={args.tp_mode}/{args.sl_mode} "
+        f"anchor={reference:.5f} distance={distance:.1f}pt tp={bracket.tp_level:.5f} sl={bracket.sl_level:.5f}",
+        flush=True,
+    )
+    return bracket
+
+
+def update_score2_bracket(mt5, args, bracket: ScoreBracket | None, score: float | None, close: float) -> ScoreBracket | None:
+    if bracket is None or score is None or not np.isfinite(score):
+        return bracket
+    distance = abs(float(score))
+    delta = distance * point_size(mt5, args.symbol)
+    if args.tp_mode == "score2":
+        bracket.tp_level = close + bracket.side * delta
+    if args.sl_mode == "score2":
+        bracket.sl_level = close - bracket.side * delta
+    bracket.distance = distance
+    print(
+        f"[{TAG}-paper] score2 recalc ticket={bracket.ticket} anchor={close:.5f} distance={distance:.1f}pt "
+        f"tp={bracket.tp_level:.5f} sl={bracket.sl_level:.5f}", flush=True,
+    )
+    return bracket
+
+
+def price_exit_if_needed(mt5, args, bracket: ScoreBracket | None) -> tuple[ScoreBracket | None, int]:
     pos = find_position(mt5, args.symbol, args.magic)
     if pos is None:
-        return 0
+        return None, 0
     move = current_move_points(mt5, args, pos)
     if move is None:
-        return 0
+        return bracket, 0
     side = 1 if int(pos.type) == mt5.POSITION_TYPE_BUY else -1
+    if bracket is not None and bracket.ticket != int(pos.ticket):
+        bracket = None
+    tick = mt5.symbol_info_tick(args.symbol)
+    close_price = float(tick.bid) if side == 1 else float(tick.ask)
+    score_tp_hit = (
+        bracket is not None and args.tp_mode in {"score1", "score2"}
+        and ((side == 1 and close_price >= bracket.tp_level) or (side == -1 and close_price <= bracket.tp_level))
+    )
+    score_sl_hit = (
+        bracket is not None and args.sl_mode in {"score1", "score2"}
+        and ((side == 1 and close_price <= bracket.sl_level) or (side == -1 and close_price >= bracket.sl_level))
+    )
     if args.tp_mode in {"fixed", "fixed_signal"} and move >= args.tp_points:
         result = send_order(mt5, args, "sell" if side == 1 else "buy", "tp_fixed", int(pos.ticket), tag=TAG)
-        return side if result is not None else 0
+        return (None, side) if result is not None else (bracket, 0)
+    if score_tp_hit:
+        result = send_order(mt5, args, "sell" if side == 1 else "buy", f"tp_{args.tp_mode}", int(pos.ticket), tag=TAG)
+        return (None, side) if result is not None else (bracket, 0)
     if args.sl_mode in {"fixed", "fixed_signal"} and move <= -args.sl_points:
         result = send_order(mt5, args, "sell" if side == 1 else "buy", "sl_fixed", int(pos.ticket), tag=TAG)
-        return side if result is not None else 0
-    return 0
+        return (None, side) if result is not None else (bracket, 0)
+    if score_sl_hit:
+        result = send_order(mt5, args, "sell" if side == 1 else "buy", f"sl_{args.sl_mode}", int(pos.ticket), tag=TAG)
+        return (None, side) if result is not None else (bracket, 0)
+    return bracket, 0
 
 
 def signal_exit(mode: str, side: int, signal: int) -> bool:
-    if mode == "fixed":
+    if mode in {"fixed", "score1", "score2"}:
         return False
     if mode in {"opposite", "fixed_signal"}:
         return signal == -side
@@ -186,7 +255,7 @@ def signal_exit(mode: str, side: int, signal: int) -> bool:
 
 
 def validate_exit(name: str, mode: str, points: float) -> None:
-    valid = {"fixed", "fixed_signal"} if points > 0 else {"opposite", "neutral"}
+    valid = {"fixed", "fixed_signal"} if points > 0 else {"opposite", "neutral", "score1", "score2"}
     if mode not in valid:
         raise SystemExit(f"{name}: mode={mode} points={points:g} is not a backtest-valid combination; choose {sorted(valid)}")
 
@@ -248,6 +317,7 @@ def main() -> None:
     last_signal = 0
     last_session_ok = None
     last_log = 0.0
+    bracket: ScoreBracket | None = None
     print(
         f"[{TAG}-paper] START symbol={args.symbol} tf={args.timeframe} window={ns.window} "
         f"horizon={meta.get('horizon', getattr(ns, 'horizon', '?'))} label_session={label_session} "
@@ -264,10 +334,14 @@ def main() -> None:
                 continue
             bid, ask = float(tick.bid), float(tick.ask)
             bucket = (int(getattr(tick, "time", int(time.time()))) * 1_000_000_000 // tf_ns) * tf_ns
-            exited_side = fixed_exit_if_needed(mt5, args)
+            bracket, exited_side = price_exit_if_needed(mt5, args, bracket)
             if exited_side:
                 reset.mark_fixed_exit(exited_side)
-                print(f"[{TAG}-paper] fixed exit side={signal_name(exited_side)} {reset.text()}", flush=True)
+                print(f"[{TAG}-paper] price exit side={signal_name(exited_side)} {reset.text()}", flush=True)
+            elif bracket is None and last_score is not None:
+                live_pos = find_position(mt5, args.symbol, args.magic)
+                if live_pos is not None:
+                    bracket = make_score_bracket(mt5, args, live_pos, last_score)
 
             if current_bucket is None:
                 current_bucket = bucket
@@ -298,12 +372,22 @@ def main() -> None:
                 )
 
                 pos = find_position(mt5, args.symbol, args.magic)
+                if pos is not None and bracket is None:
+                    bracket = make_score_bracket(mt5, args, pos, score)
+                bracket = update_score2_bracket(mt5, args, bracket, score, float(row[3]))
+                bracket, score2_exit_side = price_exit_if_needed(mt5, args, bracket)
+                if score2_exit_side:
+                    reset.mark_fixed_exit(score2_exit_side)
+                    print(f"[{TAG}-paper] score2 exit side={signal_name(score2_exit_side)} {reset.text()}", flush=True)
+                    pos = None
                 if pos is not None:
                     side = 1 if int(pos.type) == mt5.POSITION_TYPE_BUY else -1
                     move = current_move_points(mt5, args, pos)
                     exit_mode = args.tp_mode if move is not None and move >= 0 else args.sl_mode
                     if signal_exit(exit_mode, side, signal):
                         result = send_order(mt5, args, "sell" if side == 1 else "buy", f"exit_{exit_mode}", int(pos.ticket), tag=TAG)
+                        if result is not None:
+                            bracket = None
                         if result is not None and signal == -side:
                             if not allowed:
                                 print(f"[{TAG}-paper] reverse blocked by session", flush=True)
@@ -312,7 +396,11 @@ def main() -> None:
                             elif not side_allowed(args, signal):
                                 print(f"[{TAG}-paper] reverse blocked by side filter", flush=True)
                             else:
-                                send_order(mt5, args, "buy" if signal == 1 else "sell", f"reverse_{exit_mode}", tag=TAG)
+                                result = send_order(mt5, args, "buy" if signal == 1 else "sell", f"reverse_{exit_mode}", tag=TAG)
+                                if result is not None:
+                                    pos2 = find_position(mt5, args.symbol, args.magic)
+                                    if pos2 is not None:
+                                        bracket = make_score_bracket(mt5, args, pos2, score)
                 elif signal != 0:
                     if not allowed:
                         print(f"[{TAG}-paper] entry blocked by session", flush=True)
@@ -321,7 +409,11 @@ def main() -> None:
                     elif not side_allowed(args, signal):
                         print(f"[{TAG}-paper] entry blocked by side filter", flush=True)
                     else:
-                        send_order(mt5, args, "buy" if signal == 1 else "sell", f"entry_{signal_name(signal).lower()}", tag=TAG)
+                        result = send_order(mt5, args, "buy" if signal == 1 else "sell", f"entry_{signal_name(signal).lower()}", tag=TAG)
+                        if result is not None:
+                            pos2 = find_position(mt5, args.symbol, args.magic)
+                            if pos2 is not None:
+                                bracket = make_score_bracket(mt5, args, pos2, score)
 
                 current_bucket = bucket
                 cur_o = cur_h = cur_l = cur_c = bid

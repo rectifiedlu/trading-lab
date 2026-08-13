@@ -20,7 +20,14 @@ try:
 except Exception:  # pragma: no cover
     njit = None
 
-EXIT_MODES = {"opposite": 0, "neutral": 1, "fixed": 2, "fixed_signal": 3}
+EXIT_MODES = {
+    "opposite": 0,
+    "neutral": 1,
+    "fixed": 2,
+    "fixed_signal": 3,
+    "score1": 4,
+    "score2": 5,
+}
 GOLD_THRESHOLDS = [20, 40, 60, 100, 150, 200, 300, 400]
 FX_THRESHOLDS = [5, 10, 15, 20, 30, 45, 60, 75, 90]
 GOLD_TP = [0, 50, 100, 200, 300, 400]
@@ -93,6 +100,7 @@ if njit is not None:
         candle_i = 0
         tick_floor = 0
         pending_side = 0
+        pending_score = 0.0
         block_long = False
         block_short = False
 
@@ -100,6 +108,8 @@ if njit is not None:
             if pending_side != 0:
                 side = pending_side
                 pending_side = 0
+                entry_score = pending_score
+                pending_score = 0.0
                 entry_tick = tick_floor
                 if entry_tick >= len(bid):
                     break
@@ -115,6 +125,7 @@ if njit is not None:
                     continue
             else:
                 side = _sig(scores[candle_i], threshold, invert)
+                entry_score = scores[candle_i]
                 if block_long and side != 1:
                     block_long = False
                 if block_short and side != -1:
@@ -152,8 +163,12 @@ if njit is not None:
             result_points = ((bid[exit_tick] if side == 1 else ask[exit_tick]) - entry) / point_size * side
             reason = 4
             reverse_side = 0
+            reverse_score = 0.0
             trade_max = 0.0
             next_signal_candle = int(tick_to_candle[entry_tick])
+            score_distance = abs(entry_score) if np.isfinite(entry_score) else 0.0
+            tp_score_level = score_distance
+            sl_score_level = -score_distance
 
             for ti in range(entry_tick + 1, len(bid)):
                 live_points = (bid[ti] - entry) / point_size if side == 1 else (entry - ask[ti]) / point_size
@@ -178,10 +193,30 @@ if njit is not None:
                     exit_tick = ti
                     reason = 2
                     break
+                if (tp_mode == 4 or tp_mode == 5) and score_distance > 0.0 and live_points >= tp_score_level:
+                    result_points = live_points
+                    exit_tick = ti
+                    reason = 3
+                    break
+                if (sl_mode == 4 or sl_mode == 5) and score_distance > 0.0 and live_points <= sl_score_level:
+                    result_points = live_points
+                    exit_tick = ti
+                    reason = 2
+                    break
 
                 current_candle = int(tick_to_candle[ti])
                 while next_signal_candle < current_candle and next_signal_candle < len(close_idx):
                     sig = _sig(scores[next_signal_candle], threshold, invert)
+                    current_score = scores[next_signal_candle]
+                    if np.isfinite(current_score):
+                        current_distance = abs(current_score)
+                        close_tick = int(close_idx[next_signal_candle])
+                        close_bid = bid[close_tick]
+                        anchor_move = (close_bid - entry) / point_size if side == 1 else (entry - close_bid) / point_size
+                        if tp_mode == 5:
+                            tp_score_level = anchor_move + current_distance
+                        if sl_mode == 5:
+                            sl_score_level = anchor_move - current_distance
                     mode = tp_mode if live_points >= 0.0 else sl_mode
                     exit_now = False
                     if mode == 0:
@@ -196,9 +231,20 @@ if njit is not None:
                         reason = 1
                         if sig == -side:
                             reverse_side = sig
+                            reverse_score = current_score
                         break
                     next_signal_candle += 1
                 if reason == 1:
+                    break
+                if tp_mode == 5 and live_points >= tp_score_level:
+                    result_points = live_points
+                    exit_tick = ti
+                    reason = 3
+                    break
+                if sl_mode == 5 and live_points <= sl_score_level:
+                    result_points = live_points
+                    exit_tick = ti
+                    reason = 2
                     break
 
             if reason == 4:
@@ -253,6 +299,7 @@ if njit is not None:
                 break
             if reason == 1 and reverse_side != 0 and side_filter_code != -reverse_side:
                 pending_side = reverse_side
+                pending_score = reverse_score
                 continue
             candle_i = int(tick_to_candle[tick_floor])
 
@@ -328,9 +375,10 @@ def parse_exit_modes(value: str | None, default: list[str]) -> list[str]:
 
 
 def effective_modes(modes: list[str], points: float) -> list[str]:
-    allowed = {"fixed", "fixed_signal"} if points > 0 else {"opposite", "neutral"}
-    selected = [m for m in modes if m in allowed]
-    return selected or sorted(allowed)
+    # Score modes do not use a numeric point sweep. Include them once at the
+    # zero-point slot so an explicit score mode does not create duplicate rows.
+    allowed = {"fixed", "fixed_signal"} if points > 0 else {"opposite", "neutral", "score1", "score2"}
+    return [m for m in modes if m in allowed]
 
 
 def profit_factor(gross_win: float, gross_loss: float) -> float:
