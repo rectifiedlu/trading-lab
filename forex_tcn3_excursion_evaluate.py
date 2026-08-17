@@ -47,10 +47,6 @@ FIELDS = [
     "samples_ge_75pct",
     "samples_ge_90pct",
     "direction_accuracy_pct",
-    "balanced_direction_accuracy_pct",
-    "majority_direction_baseline_pct",
-    "actual_positive_pct",
-    "predicted_positive_pct",
     "mae_points",
     "median_ae_points",
     "rmse_points",
@@ -61,9 +57,6 @@ FIELDS = [
     "r2",
     "pred_mean_points",
     "actual_mean_points",
-    "pred_std_points",
-    "actual_std_points",
-    "calibration_slope",
     "model_file",
 ]
 
@@ -105,16 +98,6 @@ def score_metrics(prediction: np.ndarray, actual: np.ndarray) -> dict[str, float
     )
     mean_actual_abs = float(np.mean(np.abs(actual)))
     mae = float(np.mean(abs_error))
-    actual_positive = actual >= 0.0
-    predicted_positive = prediction >= 0.0
-    positive_rate = float(np.mean(actual_positive))
-    true_positive_rate = float(np.mean(predicted_positive[actual_positive])) if np.any(actual_positive) else 0.0
-    true_negative_rate = float(np.mean(~predicted_positive[~actual_positive])) if np.any(~actual_positive) else 0.0
-    prediction_variance = float(np.var(prediction))
-    calibration_slope = (
-        float(np.cov(prediction, actual, ddof=0)[0, 1] / prediction_variance)
-        if prediction_variance > 1e-12 else 0.0
-    )
     return {
         "samples": int(len(actual)),
         "score_accuracy_mean_pct": float(np.mean(similarity) * 100.0),
@@ -124,10 +107,6 @@ def score_metrics(prediction: np.ndarray, actual: np.ndarray) -> dict[str, float
         "samples_ge_75pct": float(np.mean(similarity >= 0.75) * 100.0),
         "samples_ge_90pct": float(np.mean(similarity >= 0.90) * 100.0),
         "direction_accuracy_pct": float(np.mean((prediction >= 0.0) == (actual >= 0.0)) * 100.0),
-        "balanced_direction_accuracy_pct": float((true_positive_rate + true_negative_rate) * 50.0),
-        "majority_direction_baseline_pct": float(max(positive_rate, 1.0 - positive_rate) * 100.0),
-        "actual_positive_pct": float(positive_rate * 100.0),
-        "predicted_positive_pct": float(np.mean(predicted_positive) * 100.0),
         "mae_points": mae,
         "median_ae_points": float(np.median(abs_error)),
         "rmse_points": float(math.sqrt(np.mean(error * error))),
@@ -138,9 +117,6 @@ def score_metrics(prediction: np.ndarray, actual: np.ndarray) -> dict[str, float
         "r2": finite_or(1.0 - residual_sum / total_sum) if total_sum > 0.0 else 0.0,
         "pred_mean_points": float(np.mean(prediction)),
         "actual_mean_points": actual_mean,
-        "pred_std_points": float(np.std(prediction)),
-        "actual_std_points": float(np.std(actual)),
-        "calibration_slope": finite_or(calibration_slope),
     }
 
 
@@ -188,9 +164,8 @@ def predict_indices(
                 extra = torch.from_numpy(extras[batch_start:batch_stop]).to(device, non_blocking=device.type == "cuda")
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
                     raw = model(x, extra)
-                score = raw[:, 0] if raw.ndim == 2 else raw.reshape(-1)
                 predictions[feature_start + batch_start:feature_start + batch_stop] = (
-                    score.float().cpu().numpy() * output_scale
+                    raw.reshape(-1).float().cpu().numpy() * output_scale
                 )
 
             done = feature_stop
@@ -230,8 +205,6 @@ def print_rankings(rows: list[dict[str, object]], top: int) -> None:
         print(
             f"#{int(row['rank']):02d} score_acc={float(row['score_accuracy_mean_pct']):6.2f}% "
             f"direction={float(row['direction_accuracy_pct']):6.2f}% "
-            f"balanced={float(row['balanced_direction_accuracy_pct']):6.2f}% "
-            f"baseline={float(row['majority_direction_baseline_pct']):6.2f}% "
             f"corr={float(row['correlation']):+.4f} mae={float(row['mae_points']):8.2f}pt "
             f"n={int(row['samples']):,} {row['pair']} {row['timeframe']} "
             f"s={row['label_session']} w={row['window']} h={row['horizon']} {row['model_file']}",
@@ -242,7 +215,7 @@ def print_rankings(rows: list[dict[str, object]], top: int) -> None:
 def main() -> None:
     parser = build_parser("TCN3 excursion score evaluator", "tcn3_excursion_evaluation.csv")
     parser.add_argument("--model-dir", required=True)
-    parser.add_argument("--model-glob", default="*excursion*_*tcn3*.pt")
+    parser.add_argument("--model-glob", default="*excursion*_*tcn3_*.pt")
     parser.add_argument("--sessions", default=None, help="filter model label sessions")
     parser.add_argument("--windows", default=None)
     parser.add_argument("--horizons", default=None)
@@ -268,7 +241,7 @@ def main() -> None:
     paths = [
         path for path in paths
         if str(parse_model_name(path).get("target", "")) == "excursion"
-        and str(parse_model_name(path).get("model", "")) in {"tcn3", "tcn3v2"}
+        and str(parse_model_name(path).get("model", "")) == "tcn3"
         and (horizons is None or int(parse_model_name(path).get("horizon", -1)) in horizons)
     ]
     paths.sort(key=lambda path: (

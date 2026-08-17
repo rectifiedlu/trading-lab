@@ -85,7 +85,7 @@ def audit_model_grid(
 def main() -> None:
     ap = build_parser("TCN3 signed-excursion tick backtest", "forex_tcn3_excursion_results.csv")
     ap.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
-    ap.add_argument("--model-glob", default="*excursion*_*tcn3*.pt")
+    ap.add_argument("--model-glob", default="*excursion*_*tcn3_*.pt")
     ap.add_argument("--thresholds", default="pair", help="'pair' uses separate XAU and FX score grids")
     ap.add_argument("--modes", default="normal,invert")
     ap.add_argument("--tp-modes", default="fixed,fixed_signal,opposite,neutral")
@@ -119,7 +119,7 @@ def main() -> None:
     paths = [
         path for path in paths
         if str(parse_model_name(path).get("target", "")) == "excursion"
-        and str(parse_model_name(path).get("model", "")) in {"tcn3", "tcn3v2"}
+        and str(parse_model_name(path).get("model", "")) == "tcn3"
         and (requested_horizons is None or int(parse_model_name(path).get("horizon", -1)) in requested_horizons)
     ]
     if not paths:

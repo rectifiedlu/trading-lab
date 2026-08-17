@@ -19,7 +19,7 @@ import os
 import pickle
 import random
 import time
-from copy import copy, deepcopy
+from copy import copy
 from dataclasses import dataclass
 
 import numpy as np
@@ -78,8 +78,6 @@ class BarrierData:
 
 
 def model_output_dim(args: argparse.Namespace) -> int:
-    if getattr(args, "target", "") == "excursion" and getattr(args, "model", "") == "tcn3v2":
-        return 2
     return 4 if getattr(args, "target", "") == "move4" else 1
 
 
@@ -997,37 +995,6 @@ class TemporalConvNet(nn.Module):
         return out.squeeze(1) if out.shape[1] == 1 else out
 
 
-class ExcursionTemporalConvNet(nn.Module):
-    """Full-window TCN with separate score-regression and direction heads."""
-
-    def __init__(self, window: int, input_dim: int, extra_dim: int, channels: int = 64, kernel: int = 3, layers: int = 5, dropout: float = 0.15):
-        super().__init__()
-        del window
-        blocks = []
-        in_ch = input_dim
-        for i in range(layers):
-            blocks.append(TemporalBlock(in_ch, channels, kernel, 2 ** i, dropout))
-            in_ch = channels
-        self.tcn = nn.Sequential(*blocks)
-        self.head = nn.Sequential(
-            nn.Linear(channels * 3 + extra_dim, channels * 2),
-            nn.LayerNorm(channels * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(channels * 2, 2),
-        )
-
-    def forward(self, x: torch.Tensor, extra: torch.Tensor) -> torch.Tensor:
-        sequence = self.tcn(x)
-        pooled = torch.cat([
-            sequence[:, :, -1],
-            sequence.mean(dim=2),
-            sequence.amax(dim=2),
-            extra,
-        ], dim=1)
-        return self.head(pooled)
-
-
 class FlatMLP(nn.Module):
     def __init__(self, window: int, input_dim: int, extra_dim: int, hidden: int = 256, dropout: float = 0.2, output_dim: int = 1):
         super().__init__()
@@ -1115,8 +1082,6 @@ def build_model(name: str, window: int, input_dim: int, extra_dim: int, args: ar
     out_dim = model_output_dim(args)
     if model_name == "cnn":
         return CandleCNN(window, input_dim=input_dim, extra_dim=extra_dim, channels=args.channels, kernel=args.kernel_size, dropout=args.dropout, output_dim=out_dim)
-    if model_name == "tcn3v2":
-        return ExcursionTemporalConvNet(window, input_dim=input_dim, extra_dim=extra_dim, channels=args.channels, kernel=args.kernel_size, layers=args.layers, dropout=args.dropout)
     if model_name in {"tcn", "tcn2", "tcn3"}:
         return TemporalConvNet(window, input_dim=input_dim, extra_dim=extra_dim, channels=args.channels, kernel=args.kernel_size, layers=args.layers, dropout=args.dropout, output_dim=out_dim)
     if model_name == "mlp":
@@ -1130,26 +1095,16 @@ def build_model(name: str, window: int, input_dim: int, extra_dim: int, args: ar
     raise ValueError(f"unknown model: {name}")
 
 
-def split_indices(data: BarrierData, window: int, train_frac: float, max_samples: int, seed: int, purge: int = 0):
+def split_indices(data: BarrierData, window: int, train_frac: float, max_samples: int, seed: int):
     idx = np.flatnonzero(data.valid)
     idx = idx[idx >= window - 1]
     if max_samples > 0 and len(idx) > max_samples:
         rng = np.random.default_rng(seed)
         idx = np.sort(rng.choice(idx, size=max_samples, replace=False))
     cut_time_idx = int(len(data.ohlc) * train_frac)
-    # A label at i consumes future candles through i + horizon. Keep those
-    # labels entirely before the temporal holdout boundary.
-    train_idx = idx[idx + max(0, int(purge)) < cut_time_idx]
+    train_idx = idx[idx < cut_time_idx]
     test_idx = idx[idx >= cut_time_idx]
     return train_idx, test_idx
-
-
-def regression_loss(prediction: torch.Tensor, target: torch.Tensor, kind: str, reduction: str = "mean") -> torch.Tensor:
-    if kind == "mse":
-        return nn.functional.mse_loss(prediction, target, reduction=reduction)
-    if kind == "mae":
-        return nn.functional.l1_loss(prediction, target, reduction=reduction)
-    return nn.functional.smooth_l1_loss(prediction, target, reduction=reduction)
 
 
 def train_model(args: argparse.Namespace, data: BarrierData, train_idx: np.ndarray, test_idx: np.ndarray):
@@ -1186,23 +1141,10 @@ def train_model(args: argparse.Namespace, data: BarrierData, train_idx: np.ndarr
             f"dropout={args.dropout:g} params={sum(p.numel() for p in model.parameters()):,}",
             flush=True,
         )
-    if args.model in {"tcn", "tcn2", "tcn3"}:
-        receptive_field = 1 + 2 * (int(args.kernel_size) - 1) * sum(2 ** i for i in range(int(args.layers)))
-        if int(args.window) > receptive_field:
-            print(
-                f"[ml] WARNING model={args.model} window={args.window} exceeds "
-                f"receptive_field={receptive_field}; earliest bars cannot affect the prediction. "
-                "Use a shorter window, more layers, or tcn3v2 full-window pooling.",
-                flush=True,
-            )
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     loss_fn = nn.BCEWithLogitsLoss()
     reg_loss_fn = nn.SmoothL1Loss()
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-    best_state = None
-    best_eval_loss = math.inf
-    best_epoch = 0
-    stale_epochs = 0
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -1218,11 +1160,7 @@ def train_model(args: argparse.Namespace, data: BarrierData, train_idx: np.ndarr
                 if args.target == "move4":
                     loss = loss_fn(logits[:, :2], y[:, :2]) + args.move_reg_weight * reg_loss_fn(torch.relu(logits[:, 2:]), y[:, 2:])
                 elif args.target == "excursion":
-                    score_prediction = logits[:, 0] if logits.ndim == 2 else logits.reshape(-1)
-                    loss = regression_loss(score_prediction, y.reshape(-1), args.reg_loss)
-                    if logits.ndim == 2 and logits.shape[1] > 1:
-                        direction_target = (y.reshape(-1) >= 0.0).to(logits.dtype)
-                        loss = loss + args.direction_loss_weight * loss_fn(logits[:, 1], direction_target)
+                    loss = reg_loss_fn(logits.reshape(-1), y.reshape(-1))
                 else:
                     loss = loss_fn(logits, y)
             scaler.scale(loss).backward()
@@ -1232,25 +1170,9 @@ def train_model(args: argparse.Namespace, data: BarrierData, train_idx: np.ndarr
             seen += len(y)
         train_loss = total_loss / max(seen, 1)
         acc, bce = evaluate_model(model, eval_loader, device, args)
-        if len(test_idx):
-            if bce < best_eval_loss - float(args.early_stopping_min_delta):
-                best_eval_loss = bce
-                best_epoch = epoch
-                best_state = deepcopy(model.state_dict())
-                stale_epochs = 0
-            else:
-                stale_epochs += 1
         if args.verbose or epoch == args.epochs:
             eval_name = "test" if len(test_idx) else "train"
             print(f"[ml] epoch {epoch:02d} train_loss={train_loss:.4f} {eval_name}_loss={bce:.4f} {eval_name}_direction_acc={acc*100:.2f}%", flush=True)
-        if len(test_idx) and args.early_stopping_patience > 0 and stale_epochs >= args.early_stopping_patience:
-            print(f"[ml] early_stop epoch={epoch} best_epoch={best_epoch} best_test_loss={best_eval_loss:.4f}", flush=True)
-            break
-    if best_state is not None:
-        model.load_state_dict(best_state)
-        args.training_best_epoch = int(best_epoch)
-        args.training_best_eval_loss = float(best_eval_loss)
-        print(f"[ml] restored best checkpoint epoch={best_epoch} test_loss={best_eval_loss:.4f}", flush=True)
     return model, device
 
 
@@ -1274,11 +1196,10 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, a
                 truth = torch.argmax(y[:, :2], dim=1)
                 correct += int((pred == truth).sum().item())
             elif args.target == "excursion":
-                pred_score = logits[:, 0] if logits.ndim == 2 else logits.reshape(-1)
+                pred_score = logits.reshape(-1)
                 true_score = y.reshape(-1)
-                loss += float(regression_loss(pred_score, true_score, args.reg_loss, reduction="sum").item())
-                direction_score = logits[:, 1] if logits.ndim == 2 and logits.shape[1] > 1 else pred_score
-                correct += int(((direction_score >= 0.0) == (true_score >= 0.0)).sum().item())
+                loss += float(nn.functional.smooth_l1_loss(pred_score, true_score, reduction="sum").item())
+                correct += int(((pred_score >= 0.0) == (true_score >= 0.0)).sum().item())
             else:
                 loss += float(loss_fn(logits, y).item())
                 pred = (torch.sigmoid(logits) >= 0.5).float()
@@ -1300,8 +1221,7 @@ def predict_probs(model: nn.Module, device: torch.device, data: BarrierData, idx
                 moves = torch.relu(raw[:, 2:]) * float(args.move_scale_points)
                 p = torch.cat([p_dir, moves], dim=1).cpu().numpy()
             elif args.target == "excursion":
-                score = raw[:, 0] if raw.ndim == 2 else raw.reshape(-1)
-                p = (score.reshape(-1, 1) * float(args.move_scale_points)).cpu().numpy()
+                p = (raw.reshape(-1, 1) * float(args.move_scale_points)).cpu().numpy()
             else:
                 p = torch.sigmoid(raw).cpu().numpy()
             out.append(p)
@@ -1832,7 +1752,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="barrier = equal up/down first; trade = side-specific win label; tpsl_direction = fixed TP/SL direction; move4 = long/short prob + max up/down forecast; nextbar = future close up probability; excursion = max-up minus max-down future excursion")
     ap.add_argument("--trade-side", choices=["long", "short"], default="long",
                     help="side to label when --target trade")
-    ap.add_argument("--model", choices=["cnn", "tcn", "tcn2", "tcn3", "tcn3v2", "mlp", "linear", "gru", "lstm", "transformer", "rf", "xgb"], default="tcn")
+    ap.add_argument("--model", choices=["cnn", "tcn", "tcn2", "tcn3", "mlp", "linear", "gru", "lstm", "transformer", "rf", "xgb"], default="tcn")
     ap.add_argument("--models", default=None,
                     help="comma list of models to sweep; overrides --model")
     ap.add_argument("--window", type=int, default=128)
@@ -1870,13 +1790,6 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-precompute-features", action="store_true",
                     help="disable cached window tensors; slower but lower peak RAM")
     ap.add_argument("--lr", type=float, default=2e-3)
-    ap.add_argument("--reg-loss", choices=["smooth_l1", "mse", "mae"], default="smooth_l1",
-                    help="regression loss for excursion and regression heads")
-    ap.add_argument("--direction-loss-weight", type=float, default=0.25,
-                    help="auxiliary sign-classification weight for tcn3v2 excursion models")
-    ap.add_argument("--early-stopping-patience", type=int, default=0,
-                    help="stop after this many validation epochs without improvement; 0 disables")
-    ap.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
     ap.add_argument("--channels", type=int, default=64)
     ap.add_argument("--channels-list", default=None,
                     help="comma list of channel/d_model sizes to sweep")
@@ -2035,14 +1948,7 @@ def run_one(args: argparse.Namespace, data: BarrierData) -> bool:
         )
     data.labels = labels
     data.valid = valid
-    train_idx, test_idx = split_indices(
-        data,
-        args.window,
-        args.train_frac,
-        args.max_samples,
-        args.seed,
-        purge=args.horizon_bars,
-    )
+    train_idx, test_idx = split_indices(data, args.window, args.train_frac, args.max_samples, args.seed)
     if args.target == "move4":
         train_up = float(np.mean(np.argmax(data.labels[train_idx, :2], axis=1))) * 100.0 if len(train_idx) else 0.0
         test_up = float(np.mean(np.argmax(data.labels[test_idx, :2], axis=1))) * 100.0 if len(test_idx) else 0.0

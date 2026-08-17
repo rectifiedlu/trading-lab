@@ -156,8 +156,7 @@ def predict_score(model, ns, candles: CandleData, point: float, device: torch.de
             torch.from_numpy(features[None]).to(device),
             torch.from_numpy(np.asarray(extras, dtype=np.float32)[None]).to(device),
         )
-    score_raw = raw[0, 0] if raw.ndim == 2 else raw.reshape(-1)[0]
-    score = float(score_raw.cpu()) * float(getattr(ns, "move_scale_points", 100.0))
+    score = float(raw.reshape(-1)[0].cpu()) * float(getattr(ns, "move_scale_points", 100.0))
     return score if np.isfinite(score) else None
 
 
