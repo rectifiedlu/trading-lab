@@ -1,0 +1,232 @@
+You are working in the trading-lab repository on the main PC, which has MT5 history, the trained TCN3 models, and enough compute for serious experiments. Work autonomously and handle this end to end. Read the repository before changing anything, preserve unrelated user changes, and pull/inspect the latest branch state safely. The latest relevant files should include:
+
+- forex_ml_barrier_cnn.py
+- forex_ml_tick_simulator.py
+- forex_tcn3_excursion_backtest.py
+- forex_tcn3_excursion_evaluate.py
+- forex_tcn3_excursion_paper.py
+- tcn3_score_exit_commands.txt
+- model directory: data/forex/tcn3_net_excursion_models_w64_w128_w192_w256_h5_h10
+
+Context and objective
+=====================
+
+TCN3 predicts one signed net-future-excursion score:
+
+    up_points = max future high over horizon - current close
+    down_points = current close - min future low over horizon
+    target_score = up_points - down_points
+
+The current corrected target metadata is:
+
+    signed_net_future_excursion_points_v1
+
+Do not casually replace this target. It is intentionally designed to measure future directional bias while penalizing adverse excursion. First determine whether the current TCN3 architecture, loss, feature representation, scaling, and training process can learn it. We have spent too much effort optimizing backtest exits before proving forecast quality.
+
+Existing mostly in-sample maximum-history evaluation found approximately:
+
+- Best bounded score similarity around 67%
+- Top models around 59-67%
+- Correlation around 0.28-0.34
+- Most/all top models use label session -1
+
+This is weak for mostly in-sample evaluation and raises the possibility that the model, features, loss, or pipeline is the bottleneck. Your job is to diagnose that rigorously and determine what model/training setup is appropriate for this approach.
+
+Non-negotiable constraints
+==========================
+
+1. Do not optimize TP/SL combinations during this task. This is forecast-model research, not execution optimization.
+2. Do not overwrite the production H1/H5/H10 checkpoints. Use a new directory under data/forex/tcn3_diagnostics/ for every experimental model and report.
+3. Use chronological splits only for generalization claims. Random sampling may be used only for the explicit memorization/capacity sanity test.
+4. Prevent leakage rigorously. A sample at candle t may use candles at or before t only. Its label may use t+1 through t+horizon. Split boundaries must purge/embargo at least the horizon so training labels cannot overlap the test period.
+5. Match each checkpoint's pair, timeframe, session, window, horizon, feature set, point size, and output scaling exactly.
+6. Use GPU, AMP, Numba, cached/chunked feature construction, and sensible batching where applicable. Maximum-history evaluation must not allocate all window tensors at once.
+7. Make long jobs resumable. Write/checkpoint CSV results after every completed model or experiment and skip already completed identical experiments unless --overwrite is passed.
+8. Keep changes scoped and tested. Commit and push the final code and prompt/report changes when finished.
+
+Phase 1: audit the pipeline before running experiments
+======================================================
+
+Trace the complete path from candle construction to saved checkpoint to evaluator prediction. Verify with small deterministic tests:
+
+- Rolling samples overlap correctly: W candles, then W-1 old candles plus one new candle.
+- Target is exactly max-up minus max-down in points for both Python and Numba paths.
+- Horizon indexing is t+1 through t+horizon with no off-by-one error.
+- Labels and predictions use the same move_scale_points conversion exactly once.
+- Training labels are scaled and evaluator predictions are converted back to points correctly.
+- Feature channel order and tensor orientation are identical in training, backtest, paper, and evaluator.
+- Session filtering selects label endpoints exactly as intended; historical input windows may cross session boundaries.
+- Chronological split plus purge has no future-label overlap.
+- Invert mode is irrelevant to model accuracy and must not affect predicted score magnitude.
+
+If you find a real pipeline bug, fix it first, add a regression test, clearly mark existing affected model results invalid, and determine whether retraining is required.
+
+Phase 2: improve the evaluator for model diagnosis
+==================================================
+
+Extend the dedicated evaluator rather than abusing --train-frac 1. It must evaluate existing saved models without retraining and produce checkpointed CSV files.
+
+For each model and selected split, calculate:
+
+- Sample count
+- Bounded per-sample score similarity already used by the evaluator
+- Direction accuracy
+- MAE, median absolute error, RMSE
+- Mean absolute actual score and normalized MAE
+- Bias
+- Pearson correlation
+- Spearman rank correlation
+- R-squared
+- Predicted and actual mean/std/p01/p05/p10/p25/p50/p75/p90/p95/p99
+- Fraction of predictions near zero
+
+Add confidence diagnostics based on abs(predicted_score):
+
+- Deciles 1 through 10
+- For each decile: sample count, predicted magnitude, actual magnitude, score similarity, direction accuracy, MAE, correlation, mean signed prediction, mean signed actual
+- Also report top 50%, 25%, 10%, 5%, and 1% confidence subsets
+
+Add calibration diagnostics:
+
+- Quantile-bin predicted scores, preserving sign
+- Mean predicted score versus mean actual score in every bin
+- Calibration slope and intercept
+- Determine whether larger predictions correspond to larger realised signed scores
+
+Produce at least:
+
+- model_summary.csv
+- confidence_bins.csv
+- calibration_bins.csv
+- a concise model_diagnostic_report.md
+
+The report must rank models globally and within each pair/timeframe/horizon so quiet session -1 models do not win merely because their targets are easier or smaller.
+
+Phase 3: establish causal baselines
+===================================
+
+Implement and evaluate these baselines on exactly the same eligible indices and chronological splits:
+
+1. Zero prediction.
+2. Training-set mean and median constant predictions. Fit constants on train only.
+3. Causal persistence: use the most recent excursion label that would be fully known at prediction time. For horizon H, do not use a label until all H future candles needed to calculate it have occurred.
+4. Linear or Ridge regression on the same input information. Fit on train only.
+5. A small MLP baseline using the same feature inputs and comparable training budget.
+
+Report lift over each baseline for MAE, direction accuracy, correlation, and high-confidence subsets. A complex TCN is not justified unless it reliably beats simple causal baselines out of sample.
+
+Phase 4: capacity/memorization sanity test
+==========================================
+
+Run a deliberately small in-sample memorization experiment first, for example:
+
+- AUDUSD
+- 5m
+- session -1
+- window 128
+- horizon 5
+- approximately 2,000 samples
+- dropout 0
+- enough epochs to converge, with learning curves saved
+
+Use one fixed sample set. TCN3 should be able to fit this tiny dataset extremely well. Record train loss, score similarity, correlation, R-squared, and prediction/target distributions by epoch.
+
+Interpretation:
+
+- If TCN3 cannot strongly fit 2,000 samples, investigate optimization, output scaling, architecture, regularization, loss, or an implementation defect.
+- If it memorizes the small set but remains weak on full training history, the relationship is heterogeneous/noisy or the capacity/training objective is insufficient for the full distribution.
+- If it fits train but fails chronological holdout, it overfits or the relationship is unstable.
+
+Do not claim success merely because direction accuracy exceeds 50%. Inspect magnitude calibration and baselines.
+
+Phase 5: controlled architecture, loss, and feature ablations
+=============================================================
+
+Do not launch a giant combinatorial sweep. Use a staged, controlled experiment on a small representative matrix first. Include at least:
+
+- AUDUSD and XAUUSD
+- One quiet/session -1 setup and one active-session setup
+- 1m and 5m initially
+- Windows 128 and 256 where compute allows
+- Horizons 1, 5, and 10 where relevant
+
+Keep all other variables fixed while changing one factor.
+
+Architecture comparisons:
+
+- Linear/Ridge baseline
+- Small MLP
+- Current TCN3
+- One sequence alternative already supported by the repo, preferably GRU or LSTM
+
+Use comparable parameter/training budgets where practical. Record parameter count and training time.
+
+Loss comparisons for the regression target:
+
+- Current Smooth-L1/Huber setup
+- MSE
+- MAE
+- A carefully justified composite loss that preserves magnitude regression while rewarding correct signed ranking/direction, such as Huber plus a small differentiable sign/ranking term
+
+Do not add a complicated loss without first showing what failure it addresses. Log gradient/loss scales so one component cannot silently dominate.
+
+Feature comparisons:
+
+- Current ohlc12 exactly as implemented
+- ohlc4
+- A compact stationary representation based on causal returns/ranges relative to the current close and point/volatility scale
+- Test time/session features on versus off
+
+Audit the current normalization. Determine whether clipping, pair-specific move scaling, current-close reference, spread channel, or redundant engineered fields cause information loss or unstable optimization. Do not assume more features are better.
+
+For each ablation use:
+
+- Chronological train/validation/test or train/test with a purged horizon boundary
+- Identical dates and sample indices
+- At least three seeds for finalists, not necessarily for every early rejection
+- Early stopping based on validation metric, never test
+- Saved learning curves and checkpoint metadata
+
+Phase 6: walk-forward confirmation of finalists
+================================================
+
+Take only the small number of configurations that clearly beat baselines. Run multiple chronological folds or expanding-window walk-forward evaluation. Report mean and dispersion across folds, not only one favorable period.
+
+A model is a credible candidate only if:
+
+- It passes the tiny-set capacity test.
+- It beats zero, persistence, and linear baselines on purged chronological holdouts.
+- Higher abs(predicted_score) generally produces better direction/score accuracy or larger correctly signed realised scores.
+- Calibration is not collapsed near zero.
+- Results are reasonably consistent across folds/seeds.
+- The useful signal is not confined to one tiny subset with too few observations.
+
+Only after those conditions are met should we use the existing TCN3 backtest to study execution.
+
+Required deliverables
+=====================
+
+1. Audited/fixed model and evaluator code with focused tests.
+2. Reproducible command file(s) for all experiments actually run.
+3. Checkpointed CSV reports for summary, confidence bins, calibration, baselines, architecture/loss/features, and walk-forward finalists.
+4. model_diagnostic_report.md containing:
+   - Pipeline audit findings
+   - Whether existing TCN3 is underfitting, overfitting, prediction-collapsed, or genuinely informative
+   - Baseline comparison
+   - Confidence/calibration findings
+   - Architecture comparison
+   - Loss comparison
+   - Feature comparison
+   - Recommended model, loss, features, and training protocol
+   - Explicit evidence and remaining uncertainty
+5. Final concise console summary with the strongest and weakest findings.
+6. Commit and push the implementation and lightweight reports/commands. Do not commit giant model files, tick data, generated caches, or huge prediction dumps.
+
+Execution order
+===============
+
+Start with the pipeline audit and existing-model diagnostics. Then run the tiny memorization test. Only then run baselines and controlled ablations. Do not spend hours on a broad architecture sweep before confirming the pipeline and capacity test. Use your judgment to reduce the experiment matrix when early evidence clearly rejects an approach, but document every such decision.
+
+The final question you must answer with evidence is:
+
+    Is current TCN3 the right model for predicting signed net future excursion? If not, is the problem the architecture, loss, features/normalization, optimization, or lack of stable predictive information in OHLC history, and what exact setup should replace it?
