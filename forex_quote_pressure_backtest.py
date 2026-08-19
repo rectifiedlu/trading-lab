@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--days", type=float, default=7.0)
     parser.add_argument(
         "--windows",
-        default="10,20,30,50,75,100,150,200,300,500,750,1000",
+        default="10,20,30,50,75,100,150,200,300,500,750,1000,1250,1500,1750,2000,2500,3000,4000,5000",
     )
     parser.add_argument(
         "--thresholds",
