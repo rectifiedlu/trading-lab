@@ -24,11 +24,17 @@ FIELDS = [
     "window",
     "threshold",
     "deadband",
+    "tp_points",
+    "sl_points",
+    "max_spread_points",
     "retreat_weight",
     "lot",
     "trades",
     "wins",
     "losses",
+    "tp_exits",
+    "sl_exits",
+    "signal_exits",
     "win_rate_pct",
     "net_points",
     "net_pnl",
@@ -65,6 +71,21 @@ def parse_args() -> argparse.Namespace:
         default="0,0.025,0.05,0.075,0.1,0.15,0.2,0.3,0.4,0.5,0.65,0.8",
     )
     parser.add_argument("--deadbands", default="0,1")
+    parser.add_argument(
+        "--tp-points",
+        default="0",
+        help="comma-separated take-profit distances in points; 0 uses signal exits",
+    )
+    parser.add_argument(
+        "--sl-points",
+        default="0",
+        help="comma-separated stop-loss distances in points; 0 uses signal exits",
+    )
+    parser.add_argument(
+        "--max-spread-points",
+        default="5,10,20,30",
+        help="comma-separated maximum entry spreads; entries require spread below the limit",
+    )
     parser.add_argument("--retreat-weight", type=float, default=0.25)
     parser.add_argument("--lot", type=float, default=0.01)
     parser.add_argument("--commission-per-lot", type=float, default=0.0)
@@ -153,6 +174,9 @@ def simulate(
     start_index: int,
     threshold: float,
     deadband: int,
+    tp_points: float,
+    sl_points: float,
+    max_spread_points: float,
     point: float,
     money_per_price: float,
     commission: float,
@@ -168,6 +192,11 @@ def simulate(
     wins = 0
     losses = 0
     total_hold_ms = 0
+    tp_exits = 0
+    sl_exits = 0
+    signal_exits = 0
+    long_blocked = False
+    short_blocked = False
 
     for index in range(start_index, len(bid)):
         pressure = quote_pressure[index]
@@ -177,19 +206,46 @@ def simulate(
         elif pressure < 0.0 and pressure <= -threshold:
             desired = -1
 
+        if desired == 0:
+            long_blocked = False
+            short_blocked = False
+
         close_position = False
+        exit_reason = 0  # 1=TP, 2=SL, 3=signal
+        position_points = 0.0
+        if position == 1:
+            position_points = (bid[index] - entry_price) / point
+        elif position == -1:
+            position_points = (entry_price - ask[index]) / point
+
+        if position != 0 and tp_points > 0.0 and position_points >= tp_points:
+            close_position = True
+            exit_reason = 1
+        elif position != 0 and sl_points > 0.0 and position_points <= -sl_points:
+            close_position = True
+            exit_reason = 2
+
+        signal_close = False
         if position == 1:
             if deadband == 1:
-                close_position = pressure < threshold
+                signal_close = pressure < threshold
             else:
-                close_position = desired == -1
+                signal_close = desired == -1
         elif position == -1:
             if deadband == 1:
-                close_position = pressure > -threshold
+                signal_close = pressure > -threshold
             else:
-                close_position = desired == 1
+                signal_close = desired == 1
+
+        if not close_position and signal_close:
+            tp_controls = position_points > 0.0 and tp_points > 0.0
+            sl_controls = position_points < 0.0 and sl_points > 0.0
+            if not tp_controls and not sl_controls:
+                close_position = True
+                exit_reason = 3
 
         if close_position:
+            closed_side = position
             exit_price = bid[index] if position == 1 else ask[index]
             price_pnl = (exit_price - entry_price) * position
             trade_pnl = price_pnl * money_per_price - commission
@@ -201,9 +257,25 @@ def simulate(
                 wins += 1
             else:
                 losses += 1
+            if exit_reason == 1:
+                tp_exits += 1
+            elif exit_reason == 2:
+                sl_exits += 1
+            else:
+                signal_exits += 1
+            if exit_reason in (1, 2):
+                # A neutral score on the exit tick already satisfies the reset.
+                if desired != 0:
+                    if closed_side == 1:
+                        long_blocked = True
+                    else:
+                        short_blocked = True
             position = 0
 
-        if position == 0 and desired != 0:
+        direction_blocked = (desired == 1 and long_blocked) or (desired == -1 and short_blocked)
+        spread_points = (ask[index] - bid[index]) / point
+        spread_allowed = spread_points < max_spread_points
+        if position == 0 and desired != 0 and not direction_blocked and spread_allowed:
             position = desired
             entry_price = ask[index] if desired == 1 else bid[index]
             entry_time = time_msc[index]
@@ -241,7 +313,19 @@ def simulate(
     max_dd_points = max_drawdown / money_per_price / point if money_per_price > 0.0 else 0.0
     net_points = net_price / point
     avg_hold_seconds = total_hold_ms / trades / 1000.0 if trades else 0.0
-    return cash, net_points, max_drawdown, max_dd_points, trades, wins, losses, avg_hold_seconds
+    return (
+        cash,
+        net_points,
+        max_drawdown,
+        max_dd_points,
+        trades,
+        wins,
+        losses,
+        avg_hold_seconds,
+        tp_exits,
+        sl_exits,
+        signal_exits,
+    )
 
 
 def load_ticks(symbol: str, days: float):
@@ -258,7 +342,14 @@ def load_ticks(symbol: str, days: float):
         & (ticks["bid"] > 0.0)
         & (ticks["ask"] >= ticks["bid"])
     )
-    return ticks[valid]
+    ticks = ticks[valid]
+    if len(ticks) < 2:
+        return ticks
+    changed = np.ones(len(ticks), dtype=np.bool_)
+    changed[1:] = (ticks["bid"][1:] != ticks["bid"][:-1]) | (
+        ticks["ask"][1:] != ticks["ask"][:-1]
+    )
+    return ticks[changed]
 
 
 def print_rankings(rows: list[dict[str, object]], key: str, top: int) -> None:
@@ -270,7 +361,9 @@ def print_rankings(rows: list[dict[str, object]], key: str, top: int) -> None:
             f"#{rank:02d} {str(row['symbol']):<8} pnl={float(row['net_pnl']):+9.2f} "
             f"dd={float(row['max_dd']):8.2f} ratio={float(row['pnl_dd']):+7.3f} "
             f"trades={int(row['trades']):6d} win={float(row['win_rate_pct']):5.1f}% "
-            f"w={row['window']} th={float(row['threshold']):g} db={row['deadband']}",
+            f"w={row['window']} th={float(row['threshold']):g} db={row['deadband']} "
+            f"tp={float(row['tp_points']):g} sl={float(row['sl_points']):g} "
+            f"spread<{float(row['max_spread_points']):g}",
             flush=True,
         )
 
@@ -278,10 +371,10 @@ def print_rankings(rows: list[dict[str, object]], key: str, top: int) -> None:
 def print_pair_summary(rows: list[dict[str, object]]) -> None:
     print("\nBest configuration per pair:")
     print(
-        "PAIR     RUNS | BEST PNL:      PNL       DD   RATIO   W    TH DB "
-        "| BEST PNL/DD:    PNL       DD   RATIO   W    TH DB"
+        "PAIR     RUNS | BEST PNL:      PNL       DD   RATIO   W    TH DB   TP   SL  SPR "
+        "| BEST PNL/DD:    PNL       DD   RATIO   W    TH DB   TP   SL  SPR"
     )
-    print("-" * 121)
+    print("-" * 151)
     for symbol in sorted({str(row["symbol"]) for row in rows}):
         pair_rows = [row for row in rows if row["symbol"] == symbol]
         best_pnl = max(pair_rows, key=lambda row: float(row["net_pnl"]))
@@ -290,10 +383,14 @@ def print_pair_summary(rows: list[dict[str, object]]) -> None:
             f"{symbol:<8} {len(pair_rows):4d} | "
             f"{float(best_pnl['net_pnl']):+9.2f} {float(best_pnl['max_dd']):8.2f} "
             f"{float(best_pnl['pnl_dd']):+7.3f} {int(best_pnl['window']):4d} "
-            f"{float(best_pnl['threshold']):5g} {int(best_pnl['deadband']):2d} | "
+            f"{float(best_pnl['threshold']):5g} {int(best_pnl['deadband']):2d} "
+            f"{float(best_pnl['tp_points']):4g} {float(best_pnl['sl_points']):4g} "
+            f"{float(best_pnl['max_spread_points']):4g} | "
             f"{float(best_ratio['net_pnl']):+9.2f} {float(best_ratio['max_dd']):8.2f} "
             f"{float(best_ratio['pnl_dd']):+7.3f} {int(best_ratio['window']):4d} "
-            f"{float(best_ratio['threshold']):5g} {int(best_ratio['deadband']):2d}",
+            f"{float(best_ratio['threshold']):5g} {int(best_ratio['deadband']):2d} "
+            f"{float(best_ratio['tp_points']):4g} {float(best_ratio['sl_points']):4g} "
+            f"{float(best_ratio['max_spread_points']):4g}",
             flush=True,
         )
 
@@ -304,6 +401,9 @@ def run_symbol(
     windows: list[int],
     thresholds: list[float],
     deadbands: list[int],
+    take_profits: list[float],
+    stop_losses: list[float],
+    max_spreads: list[float],
     pair_index: int,
     pair_count: int,
 ) -> list[dict[str, object]]:
@@ -329,7 +429,14 @@ def run_symbol(
     commission = args.lot * args.commission_per_lot
     contribution, activity, _ = quote_components(bid, ask, args.retreat_weight)
     eligible_windows = [window for window in windows if window < len(ticks)]
-    combinations = len(eligible_windows) * len(thresholds) * len(deadbands)
+    combinations = (
+        len(eligible_windows)
+        * len(thresholds)
+        * len(deadbands)
+        * len(take_profits)
+        * len(stop_losses)
+        * len(max_spreads)
+    )
     if not combinations:
         raise RuntimeError(f"Not enough ticks for any requested window on {symbol}")
 
@@ -348,60 +455,93 @@ def run_symbol(
         pressure = rolling_ratio(contribution, activity, window)
         for threshold in thresholds:
             for deadband in deadbands:
-                result = simulate(
-                    bid,
-                    ask,
-                    time_msc,
-                    pressure,
-                    window,
-                    threshold,
-                    deadband,
-                    point,
-                    money_per_price,
-                    commission,
-                )
-                net_pnl, net_points, max_dd, max_dd_points, trades, wins, losses, avg_hold = result
-                completed += 1
-                win_rate = wins / trades * 100.0 if trades else 0.0
-                pnl_dd = net_pnl / max_dd if max_dd > 1e-12 else 0.0
-                rows.append({
-                    "rank_pnl": 0,
-                    "rank_pnl_dd": 0,
-                    "symbol": symbol,
-                    "days": args.days,
-                    "ticks": len(ticks),
-                    "window": window,
-                    "threshold": threshold,
-                    "deadband": deadband,
-                    "retreat_weight": args.retreat_weight,
-                    "lot": args.lot,
-                    "trades": trades,
-                    "wins": wins,
-                    "losses": losses,
-                    "win_rate_pct": win_rate,
-                    "net_points": net_points,
-                    "net_pnl": net_pnl,
-                    "max_dd_points": max_dd_points,
-                    "max_dd": max_dd,
-                    "pnl_dd": pnl_dd,
-                    "avg_trade_points": net_points / trades if trades else 0.0,
-                    "avg_hold_seconds": avg_hold,
-                    "start_utc": datetime.fromtimestamp(int(ticks[0]["time"]), timezone.utc).isoformat(),
-                    "end_utc": datetime.fromtimestamp(int(ticks[-1]["time"]), timezone.utc).isoformat(),
-                })
-                should_report = (
-                    args.progress_every > 0
-                    and (completed % args.progress_every == 0 or completed == combinations)
-                )
-                if should_report:
-                    elapsed = time.perf_counter() - pair_started
-                    eta = elapsed / completed * (combinations - completed)
-                    print(
-                        f"[quote-bt] {symbol} {completed:4d}/{combinations} "
-                        f"({completed / combinations:5.1%}) elapsed={elapsed:6.1f}s "
-                        f"eta={eta:6.1f}s latest pnl={net_pnl:+.2f}",
-                        flush=True,
+                for tp_points in take_profits:
+                    for sl_points in stop_losses:
+                     for max_spread_points in max_spreads:
+                        result = simulate(
+                        bid,
+                        ask,
+                        time_msc,
+                        pressure,
+                        window,
+                        threshold,
+                        deadband,
+                        tp_points,
+                        sl_points,
+                        max_spread_points,
+                        point,
+                        money_per_price,
+                        commission,
                     )
+                        (
+                            net_pnl,
+                            net_points,
+                            max_dd,
+                            max_dd_points,
+                            trades,
+                            wins,
+                            losses,
+                            avg_hold,
+                            tp_exits,
+                            sl_exits,
+                            signal_exits,
+                        ) = result
+                        completed += 1
+                        win_rate = wins / trades * 100.0 if trades else 0.0
+                        pnl_dd = net_pnl / max_dd if max_dd > 1e-12 else 0.0
+                        rows.append({
+                            "rank_pnl": 0,
+                            "rank_pnl_dd": 0,
+                            "symbol": symbol,
+                            "days": args.days,
+                            "ticks": len(ticks),
+                            "window": window,
+                            "threshold": threshold,
+                            "deadband": deadband,
+                            "tp_points": tp_points,
+                            "sl_points": sl_points,
+                            "max_spread_points": max_spread_points,
+                            "retreat_weight": args.retreat_weight,
+                            "lot": args.lot,
+                            "trades": trades,
+                            "wins": wins,
+                            "losses": losses,
+                            "tp_exits": tp_exits,
+                            "sl_exits": sl_exits,
+                            "signal_exits": signal_exits,
+                            "win_rate_pct": win_rate,
+                            "net_points": net_points,
+                            "net_pnl": net_pnl,
+                            "max_dd_points": max_dd_points,
+                            "max_dd": max_dd,
+                            "pnl_dd": pnl_dd,
+                            "avg_trade_points": net_points / trades if trades else 0.0,
+                            "avg_hold_seconds": avg_hold,
+                            "start_utc": datetime.fromtimestamp(
+                                int(ticks[0]["time"]), timezone.utc
+                            ).isoformat(),
+                            "end_utc": datetime.fromtimestamp(
+                                int(ticks[-1]["time"]), timezone.utc
+                            ).isoformat(),
+                        })
+                        should_report = (
+                            args.progress_every > 0
+                            and (
+                                completed % args.progress_every == 0
+                                or completed == combinations
+                            )
+                        )
+                        if should_report:
+                            elapsed = time.perf_counter() - pair_started
+                            eta = elapsed / completed * (combinations - completed)
+                            print(
+                                f"[quote-bt] {symbol} {completed:4d}/{combinations} "
+                                f"({completed / combinations:5.1%}) elapsed={elapsed:6.1f}s "
+                                f"eta={eta:6.1f}s latest pnl={net_pnl:+.2f} "
+                                f"tp={tp_points:g} sl={sl_points:g} "
+                                f"spread<{max_spread_points:g}",
+                                flush=True,
+                            )
     return rows
 
 
@@ -411,6 +551,9 @@ def main() -> None:
     windows = sorted(set(parse_number_list(args.windows, int)))
     thresholds = sorted(set(parse_number_list(args.thresholds, float)))
     deadbands = sorted(set(parse_number_list(args.deadbands, int)))
+    take_profits = sorted(set(parse_number_list(args.tp_points, float)))
+    stop_losses = sorted(set(parse_number_list(args.sl_points, float)))
+    max_spreads = sorted(set(parse_number_list(args.max_spread_points, float)))
     if args.days <= 0.0:
         raise SystemExit("--days must be positive")
     if not windows or min(windows) < 2:
@@ -419,6 +562,12 @@ def main() -> None:
         raise SystemExit("--thresholds values must be between 0 and 1")
     if not deadbands or any(value not in (0, 1) for value in deadbands):
         raise SystemExit("--deadbands values must be 0 or 1")
+    if not take_profits or min(take_profits) < 0.0:
+        raise SystemExit("--tp-points values cannot be negative")
+    if not stop_losses or min(stop_losses) < 0.0:
+        raise SystemExit("--sl-points values cannot be negative")
+    if not max_spreads or min(max_spreads) <= 0.0:
+        raise SystemExit("--max-spread-points values must be positive")
     if not 0.0 <= args.retreat_weight <= 1.0:
         raise SystemExit("--retreat-weight must be between 0 and 1")
     if args.lot <= 0.0:
@@ -437,7 +586,8 @@ def main() -> None:
         print(
             f"[quote-bt] plan pairs={symbols} days={args.days:g} "
             f"windows={len(windows)} thresholds={len(thresholds)} "
-            f"deadbands={deadbands}",
+            f"deadbands={deadbands} tp_points={take_profits} sl_points={stop_losses} "
+            f"max_spread_points={max_spreads}",
             flush=True,
         )
         for pair_index, symbol in enumerate(symbols, 1):
@@ -449,6 +599,9 @@ def main() -> None:
                         windows,
                         thresholds,
                         deadbands,
+                        take_profits,
+                        stop_losses,
+                        max_spreads,
                         pair_index,
                         len(symbols),
                     )
