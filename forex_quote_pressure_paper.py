@@ -60,6 +60,12 @@ def parse_args() -> argparse.Namespace:
         help="absolute quoteP required to open or maintain a position",
     )
     parser.add_argument(
+        "--signal-mode",
+        choices=["normal", "invert"],
+        default="normal",
+        help="normal uses quote pressure as-is; invert negates it",
+    )
+    parser.add_argument(
         "--deadband",
         type=int,
         choices=[0, 1],
@@ -77,6 +83,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="stop-loss distance in symbol points; 0 keeps normal signal exits",
+    )
+    parser.add_argument(
+        "--max-spread-points",
+        type=float,
+        default=30.0,
+        help="new entries require the current spread to be below this many points",
     )
     parser.add_argument("--deviation", type=int, default=20)
     parser.add_argument("--magic", type=int, default=26081901)
@@ -99,6 +111,10 @@ def pressure_side(quote_pressure: float, threshold: float) -> str | None:
     if quote_pressure < 0.0 and quote_pressure <= -threshold:
         return "sell"
     return None
+
+
+def apply_signal_mode(quote_pressure: float, signal_mode: str) -> float:
+    return -quote_pressure if signal_mode == "invert" else quote_pressure
 
 
 def pressure_supports(side: str, quote_pressure: float, threshold: float) -> bool:
@@ -150,6 +166,15 @@ def position_pnl_points(position, bid: float, ask: float, point: float) -> float
     return (float(position.price_open) - ask) / point
 
 
+def entry_spread_allowed(
+    bid: float,
+    ask: float,
+    point: float,
+    max_spread_points: float,
+) -> bool:
+    return (ask - bid) / point < max_spread_points
+
+
 def trade_quote_pressure(
     args: argparse.Namespace,
     quote_pressure: float,
@@ -171,6 +196,8 @@ def trade_quote_pressure(
     position = find_position(mt5, args.symbol, args.magic)
     if position is None:
         if desired_side is None or desired_side in blocked_sides:
+            return False
+        if not entry_spread_allowed(bid, ask, point, args.max_spread_points):
             return False
         return order_succeeded(
             send_order(mt5, args, desired_side, f"quoteP_{quote_pressure:+.3f}", tag="quote")
@@ -215,7 +242,21 @@ def trade_quote_pressure(
         )
         return True
 
-    if desired_side is not None and desired_side not in blocked_sides:
+    latest_tick = mt5.symbol_info_tick(args.symbol)
+    reverse_spread_allowed = (
+        latest_tick is not None
+        and entry_spread_allowed(
+            float(latest_tick.bid),
+            float(latest_tick.ask),
+            point,
+            args.max_spread_points,
+        )
+    )
+    if (
+        desired_side is not None
+        and desired_side not in blocked_sides
+        and reverse_spread_allowed
+    ):
         send_order(
             mt5,
             args,
@@ -312,6 +353,8 @@ def main() -> None:
         raise SystemExit("--tp-points cannot be negative")
     if args.sl_points < 0.0:
         raise SystemExit("--sl-points cannot be negative")
+    if args.max_spread_points <= 0.0:
+        raise SystemExit("--max-spread-points must be positive")
     if args.order_cooldown < 0.0:
         raise SystemExit("--order-cooldown cannot be negative")
 
@@ -350,6 +393,8 @@ def main() -> None:
         print(
             f"Watching {symbol}: pressure=-1 down, 0 balanced, +1 up "
             f"(window={args.window} updates, retreat_weight={args.retreat_weight:g}, "
+            f"mode={args.signal_mode}, "
+            f"spread<{args.max_spread_points:g}pt, "
             "Ctrl+C to stop)",
             flush=True,
         )
@@ -399,11 +444,13 @@ def main() -> None:
                 sum(quote_contributions) / total_quote_activity
                 if total_quote_activity else 0.0
             )
-            desired_side = pressure_side(quote_pressure, args.threshold)
+            signal_pressure = apply_signal_mode(quote_pressure, args.signal_mode)
+            desired_side = pressure_side(signal_pressure, args.threshold)
             if desired_side is None and blocked_sides:
                 blocked_sides.clear()
                 print("[quote-paper] pressure neutral; point-exit reset cleared", flush=True)
             spread_points = (ask - bid) / point
+            spread_allowed = spread_points < args.max_spread_points
             movement_points = movement / point
             timestamp = datetime.fromtimestamp(
                 tick.time_msc / 1000.0,
@@ -413,8 +460,11 @@ def main() -> None:
             print(
                 f"[{timestamp} UTC] {symbol} "
                 f"bid={bid:.{digits}f} ask={ask:.{digits}f} "
-                f"spread={spread_points:6.1f}pt move={movement_points:+6.1f}pt "
+                f"spread={spread_points:6.1f}pt"
+                f"{' BLOCK' if not spread_allowed else '':<6} "
+                f"move={movement_points:+6.1f}pt "
                 f"midP={pressure:+.3f} quoteP={quote_pressure:+.3f} "
+                f"signalP={signal_pressure:+.3f} "
                 f"samples={len(movements):3d}/{args.window}",
                 flush=True,
             )
@@ -435,11 +485,13 @@ def main() -> None:
                     exit_reason = position_exit_reason(
                         args,
                         current_side,
-                        quote_pressure,
+                        signal_pressure,
                         pnl_points,
                     )
                 needs_action = (
-                    desired_side is not None and desired_side not in blocked_sides
+                    desired_side is not None
+                    and desired_side not in blocked_sides
+                    and spread_allowed
                     if current_side is None
                     else exit_reason is not None
                 )
@@ -447,7 +499,7 @@ def main() -> None:
                     last_order_attempt = time.monotonic()
                     trade_quote_pressure(
                         args,
-                        quote_pressure,
+                        signal_pressure,
                         bid,
                         ask,
                         point,

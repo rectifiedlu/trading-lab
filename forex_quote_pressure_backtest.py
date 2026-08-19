@@ -8,6 +8,7 @@ import csv
 import math
 import time
 from datetime import datetime, timedelta, timezone
+from itertools import product
 from pathlib import Path
 
 import MetaTrader5 as mt5
@@ -18,12 +19,14 @@ from numba import njit
 FIELDS = [
     "rank_pnl",
     "rank_pnl_dd",
+    "asset_class",
     "symbol",
     "days",
     "ticks",
     "window",
     "threshold",
     "deadband",
+    "signal_mode",
     "tp_points",
     "sl_points",
     "max_spread_points",
@@ -71,6 +74,11 @@ def parse_args() -> argparse.Namespace:
         default="0,0.025,0.05,0.075,0.1,0.15,0.2,0.3,0.4,0.5,0.65,0.8",
     )
     parser.add_argument("--deadbands", default="0,1")
+    parser.add_argument(
+        "--signal-modes",
+        default="normal,invert",
+        help="comma-separated signal directions: normal,invert",
+    )
     parser.add_argument(
         "--tp-points",
         default="0",
@@ -174,6 +182,7 @@ def simulate(
     start_index: int,
     threshold: float,
     deadband: int,
+    signal_multiplier: int,
     tp_points: float,
     sl_points: float,
     max_spread_points: float,
@@ -199,7 +208,7 @@ def simulate(
     short_blocked = False
 
     for index in range(start_index, len(bid)):
-        pressure = quote_pressure[index]
+        pressure = quote_pressure[index] * signal_multiplier
         desired = 0
         if pressure > 0.0 and pressure >= threshold:
             desired = 1
@@ -352,29 +361,84 @@ def load_ticks(symbol: str, days: float):
     return ticks[changed]
 
 
-def print_rankings(rows: list[dict[str, object]], key: str, top: int) -> None:
-    label = "PnL" if key == "net_pnl" else "PnL/DD"
-    print(f"\nTop {min(top, len(rows))} globally by {label}:")
-    ordered = sorted(rows, key=lambda row: float(row[key]), reverse=True)
-    for rank, row in enumerate(ordered[:top], 1):
-        print(
-            f"#{rank:02d} {str(row['symbol']):<8} pnl={float(row['net_pnl']):+9.2f} "
-            f"dd={float(row['max_dd']):8.2f} ratio={float(row['pnl_dd']):+7.3f} "
-            f"trades={int(row['trades']):6d} win={float(row['win_rate_pct']):5.1f}% "
-            f"w={row['window']} th={float(row['threshold']):g} db={row['deadband']} "
-            f"tp={float(row['tp_points']):g} sl={float(row['sl_points']):g} "
-            f"spread<{float(row['max_spread_points']):g}",
-            flush=True,
+def print_ranking_table(
+    title: str,
+    rows: list[dict[str, object]],
+    key: str,
+    top: int,
+) -> None:
+    candidates = rows
+    if key == "pnl_dd":
+        candidates = [
+            row for row in rows
+            if int(row["trades"]) > 0
+            and float(row["net_pnl"]) > 0.0
+            and float(row["max_dd"]) > 0.0
+        ]
+    ranked = sorted(candidates, key=lambda row: float(row[key]), reverse=True)[:top]
+    print(f"\n  {title}", flush=True)
+    if not ranked:
+        print("  no qualifying results", flush=True)
+        return
+
+    headers = [
+        "#", "pair", "mode", "w", "th", "db", "tp", "sl", "spr<",
+        "pnl", "dd", "pnl/dd", "tr", "wr%", "avg_tr", "hold_s",
+    ]
+    table = []
+    for rank, row in enumerate(ranked, 1):
+        table.append([
+            str(rank),
+            str(row["symbol"]),
+            str(row["signal_mode"]),
+            str(row["window"]),
+            f"{float(row['threshold']):g}",
+            str(row["deadband"]),
+            f"{float(row['tp_points']):g}",
+            f"{float(row['sl_points']):g}",
+            f"{float(row['max_spread_points']):g}",
+            f"${float(row['net_pnl']):+.2f}",
+            f"${float(row['max_dd']):.2f}",
+            f"{float(row['pnl_dd']):.2f}",
+            str(row["trades"]),
+            f"{float(row['win_rate_pct']):.1f}",
+            f"{float(row['avg_trade_points']):+.2f}",
+            f"{float(row['avg_hold_seconds']):.1f}",
+        ])
+    widths = [len(header) for header in headers]
+    for row in table:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], len(value))
+    print("  " + " ".join(value.rjust(widths[i]) for i, value in enumerate(headers)), flush=True)
+    print("  " + "-" * (sum(widths) + len(widths) - 1), flush=True)
+    for row in table:
+        print("  " + " ".join(value.rjust(widths[i]) for i, value in enumerate(row)), flush=True)
+
+
+def print_grouped_rankings(rows: list[dict[str, object]], top: int) -> None:
+    groups = [
+        ("XAUUSD", [row for row in rows if row["asset_class"] == "XAUUSD"]),
+        ("FX", [row for row in rows if row["asset_class"] == "FX"]),
+    ]
+    for group_name, group_rows in groups:
+        if not group_rows:
+            continue
+        print_ranking_table(f"{group_name} top by total PnL", group_rows, "net_pnl", top)
+        print_ranking_table(
+            f"{group_name} top by total/account DD (PnL/DD)",
+            group_rows,
+            "pnl_dd",
+            top,
         )
 
 
 def print_pair_summary(rows: list[dict[str, object]]) -> None:
     print("\nBest configuration per pair:")
     print(
-        "PAIR     RUNS | BEST PNL:      PNL       DD   RATIO   W    TH DB   TP   SL  SPR "
-        "| BEST PNL/DD:    PNL       DD   RATIO   W    TH DB   TP   SL  SPR"
+        "PAIR     RUNS | BEST PNL:      PNL       DD   RATIO   W    TH DB MODE   TP   SL  SPR "
+        "| BEST PNL/DD:    PNL       DD   RATIO   W    TH DB MODE   TP   SL  SPR"
     )
-    print("-" * 151)
+    print("-" * 165)
     for symbol in sorted({str(row["symbol"]) for row in rows}):
         pair_rows = [row for row in rows if row["symbol"] == symbol]
         best_pnl = max(pair_rows, key=lambda row: float(row["net_pnl"]))
@@ -384,11 +448,13 @@ def print_pair_summary(rows: list[dict[str, object]]) -> None:
             f"{float(best_pnl['net_pnl']):+9.2f} {float(best_pnl['max_dd']):8.2f} "
             f"{float(best_pnl['pnl_dd']):+7.3f} {int(best_pnl['window']):4d} "
             f"{float(best_pnl['threshold']):5g} {int(best_pnl['deadband']):2d} "
+            f"{str(best_pnl['signal_mode']):<6} "
             f"{float(best_pnl['tp_points']):4g} {float(best_pnl['sl_points']):4g} "
             f"{float(best_pnl['max_spread_points']):4g} | "
             f"{float(best_ratio['net_pnl']):+9.2f} {float(best_ratio['max_dd']):8.2f} "
             f"{float(best_ratio['pnl_dd']):+7.3f} {int(best_ratio['window']):4d} "
             f"{float(best_ratio['threshold']):5g} {int(best_ratio['deadband']):2d} "
+            f"{str(best_ratio['signal_mode']):<6} "
             f"{float(best_ratio['tp_points']):4g} {float(best_ratio['sl_points']):4g} "
             f"{float(best_ratio['max_spread_points']):4g}",
             flush=True,
@@ -401,6 +467,7 @@ def run_symbol(
     windows: list[int],
     thresholds: list[float],
     deadbands: list[int],
+    signal_modes: list[str],
     take_profits: list[float],
     stop_losses: list[float],
     max_spreads: list[float],
@@ -433,6 +500,7 @@ def run_symbol(
         len(eligible_windows)
         * len(thresholds)
         * len(deadbands)
+        * len(signal_modes)
         * len(take_profits)
         * len(stop_losses)
         * len(max_spreads)
@@ -453,95 +521,111 @@ def run_symbol(
     pair_started = time.perf_counter()
     for window in eligible_windows:
         pressure = rolling_ratio(contribution, activity, window)
-        for threshold in thresholds:
-            for deadband in deadbands:
-                for tp_points in take_profits:
-                    for sl_points in stop_losses:
-                     for max_spread_points in max_spreads:
-                        result = simulate(
-                        bid,
-                        ask,
-                        time_msc,
-                        pressure,
-                        window,
-                        threshold,
-                        deadband,
-                        tp_points,
-                        sl_points,
-                        max_spread_points,
-                        point,
-                        money_per_price,
-                        commission,
-                    )
-                        (
-                            net_pnl,
-                            net_points,
-                            max_dd,
-                            max_dd_points,
-                            trades,
-                            wins,
-                            losses,
-                            avg_hold,
-                            tp_exits,
-                            sl_exits,
-                            signal_exits,
-                        ) = result
-                        completed += 1
-                        win_rate = wins / trades * 100.0 if trades else 0.0
-                        pnl_dd = net_pnl / max_dd if max_dd > 1e-12 else 0.0
-                        rows.append({
-                            "rank_pnl": 0,
-                            "rank_pnl_dd": 0,
-                            "symbol": symbol,
-                            "days": args.days,
-                            "ticks": len(ticks),
-                            "window": window,
-                            "threshold": threshold,
-                            "deadband": deadband,
-                            "tp_points": tp_points,
-                            "sl_points": sl_points,
-                            "max_spread_points": max_spread_points,
-                            "retreat_weight": args.retreat_weight,
-                            "lot": args.lot,
-                            "trades": trades,
-                            "wins": wins,
-                            "losses": losses,
-                            "tp_exits": tp_exits,
-                            "sl_exits": sl_exits,
-                            "signal_exits": signal_exits,
-                            "win_rate_pct": win_rate,
-                            "net_points": net_points,
-                            "net_pnl": net_pnl,
-                            "max_dd_points": max_dd_points,
-                            "max_dd": max_dd,
-                            "pnl_dd": pnl_dd,
-                            "avg_trade_points": net_points / trades if trades else 0.0,
-                            "avg_hold_seconds": avg_hold,
-                            "start_utc": datetime.fromtimestamp(
-                                int(ticks[0]["time"]), timezone.utc
-                            ).isoformat(),
-                            "end_utc": datetime.fromtimestamp(
-                                int(ticks[-1]["time"]), timezone.utc
-                            ).isoformat(),
-                        })
-                        should_report = (
-                            args.progress_every > 0
-                            and (
-                                completed % args.progress_every == 0
-                                or completed == combinations
-                            )
-                        )
-                        if should_report:
-                            elapsed = time.perf_counter() - pair_started
-                            eta = elapsed / completed * (combinations - completed)
-                            print(
-                                f"[quote-bt] {symbol} {completed:4d}/{combinations} "
-                                f"({completed / combinations:5.1%}) elapsed={elapsed:6.1f}s "
-                                f"eta={eta:6.1f}s latest pnl={net_pnl:+.2f} "
-                                f"tp={tp_points:g} sl={sl_points:g} "
-                                f"spread<{max_spread_points:g}",
-                                flush=True,
-                            )
+        configurations = product(
+            thresholds,
+            deadbands,
+            signal_modes,
+            take_profits,
+            stop_losses,
+            max_spreads,
+        )
+        for (
+            threshold,
+            deadband,
+            signal_mode,
+            tp_points,
+            sl_points,
+            max_spread_points,
+        ) in configurations:
+            signal_multiplier = 1 if signal_mode == "normal" else -1
+            result = simulate(
+                bid,
+                ask,
+                time_msc,
+                pressure,
+                window,
+                threshold,
+                deadband,
+                signal_multiplier,
+                tp_points,
+                sl_points,
+                max_spread_points,
+                point,
+                money_per_price,
+                commission,
+            )
+            (
+                net_pnl,
+                net_points,
+                max_dd,
+                max_dd_points,
+                trades,
+                wins,
+                losses,
+                avg_hold,
+                tp_exits,
+                sl_exits,
+                signal_exits,
+            ) = result
+            completed += 1
+            win_rate = wins / trades * 100.0 if trades else 0.0
+            pnl_dd = net_pnl / max_dd if max_dd > 1e-12 else 0.0
+            rows.append({
+                "rank_pnl": 0,
+                "rank_pnl_dd": 0,
+                "asset_class": "XAUUSD" if symbol.startswith("XAU") else "FX",
+                "symbol": symbol,
+                "days": args.days,
+                "ticks": len(ticks),
+                "window": window,
+                "threshold": threshold,
+                "deadband": deadband,
+                "signal_mode": signal_mode,
+                "tp_points": tp_points,
+                "sl_points": sl_points,
+                "max_spread_points": max_spread_points,
+                "retreat_weight": args.retreat_weight,
+                "lot": args.lot,
+                "trades": trades,
+                "wins": wins,
+                "losses": losses,
+                "tp_exits": tp_exits,
+                "sl_exits": sl_exits,
+                "signal_exits": signal_exits,
+                "win_rate_pct": win_rate,
+                "net_points": net_points,
+                "net_pnl": net_pnl,
+                "max_dd_points": max_dd_points,
+                "max_dd": max_dd,
+                "pnl_dd": pnl_dd,
+                "avg_trade_points": net_points / trades if trades else 0.0,
+                "avg_hold_seconds": avg_hold,
+                "start_utc": datetime.fromtimestamp(
+                    int(ticks[0]["time"]), timezone.utc
+                ).isoformat(),
+                "end_utc": datetime.fromtimestamp(
+                    int(ticks[-1]["time"]), timezone.utc
+                ).isoformat(),
+            })
+            should_report = (
+                args.progress_every > 0
+                and (
+                    completed % args.progress_every == 0
+                    or completed == combinations
+                )
+            )
+            if should_report:
+                elapsed = time.perf_counter() - pair_started
+                eta = elapsed / completed * (combinations - completed)
+                print(
+                    f"[quote-bt] {symbol} {completed:4d}/{combinations} "
+                    f"({completed / combinations:5.1%}) elapsed={elapsed:6.1f}s "
+                    f"eta={eta:6.1f}s latest pnl={net_pnl:+.2f} "
+                    f"mode={signal_mode} "
+                    f"tp={tp_points:g} sl={sl_points:g} "
+                    f"spread<{max_spread_points:g}",
+                    flush=True,
+                )
     return rows
 
 
@@ -551,6 +635,9 @@ def main() -> None:
     windows = sorted(set(parse_number_list(args.windows, int)))
     thresholds = sorted(set(parse_number_list(args.thresholds, float)))
     deadbands = sorted(set(parse_number_list(args.deadbands, int)))
+    signal_modes = list(dict.fromkeys(
+        item.strip().lower() for item in args.signal_modes.split(",") if item.strip()
+    ))
     take_profits = sorted(set(parse_number_list(args.tp_points, float)))
     stop_losses = sorted(set(parse_number_list(args.sl_points, float)))
     max_spreads = sorted(set(parse_number_list(args.max_spread_points, float)))
@@ -562,6 +649,8 @@ def main() -> None:
         raise SystemExit("--thresholds values must be between 0 and 1")
     if not deadbands or any(value not in (0, 1) for value in deadbands):
         raise SystemExit("--deadbands values must be 0 or 1")
+    if not signal_modes or any(value not in ("normal", "invert") for value in signal_modes):
+        raise SystemExit("--signal-modes values must be normal or invert")
     if not take_profits or min(take_profits) < 0.0:
         raise SystemExit("--tp-points values cannot be negative")
     if not stop_losses or min(stop_losses) < 0.0:
@@ -586,7 +675,8 @@ def main() -> None:
         print(
             f"[quote-bt] plan pairs={symbols} days={args.days:g} "
             f"windows={len(windows)} thresholds={len(thresholds)} "
-            f"deadbands={deadbands} tp_points={take_profits} sl_points={stop_losses} "
+            f"deadbands={deadbands} signal_modes={signal_modes} "
+            f"tp_points={take_profits} sl_points={stop_losses} "
             f"max_spread_points={max_spreads}",
             flush=True,
         )
@@ -599,6 +689,7 @@ def main() -> None:
                         windows,
                         thresholds,
                         deadbands,
+                        signal_modes,
                         take_profits,
                         stop_losses,
                         max_spreads,
@@ -614,13 +705,27 @@ def main() -> None:
         if not rows:
             raise RuntimeError("No pair produced backtest results")
 
-        pnl_order = sorted(range(len(rows)), key=lambda index: float(rows[index]["net_pnl"]), reverse=True)
-        ratio_order = sorted(range(len(rows)), key=lambda index: float(rows[index]["pnl_dd"]), reverse=True)
-        for rank, index in enumerate(pnl_order, 1):
-            rows[index]["rank_pnl"] = rank
-        for rank, index in enumerate(ratio_order, 1):
-            rows[index]["rank_pnl_dd"] = rank
-        rows.sort(key=lambda row: int(row["rank_pnl"]))
+        for asset_class in ("XAUUSD", "FX"):
+            indices = [
+                index for index, row in enumerate(rows)
+                if row["asset_class"] == asset_class
+            ]
+            pnl_order = sorted(
+                indices,
+                key=lambda index: float(rows[index]["net_pnl"]),
+                reverse=True,
+            )
+            ratio_order = sorted(
+                indices,
+                key=lambda index: float(rows[index]["pnl_dd"]),
+                reverse=True,
+            )
+            for rank, index in enumerate(pnl_order, 1):
+                rows[index]["rank_pnl"] = rank
+            for rank, index in enumerate(ratio_order, 1):
+                rows[index]["rank_pnl_dd"] = rank
+        class_order = {"XAUUSD": 0, "FX": 1}
+        rows.sort(key=lambda row: (class_order[str(row["asset_class"])], int(row["rank_pnl"])))
 
         output = Path(args.out)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -629,8 +734,7 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(rows)
         print_pair_summary(rows)
-        print_rankings(rows, "net_pnl", args.top)
-        print_rankings(rows, "pnl_dd", args.top)
+        print_grouped_rankings(rows, args.top)
         print(
             f"\n[quote-bt] wrote {len(rows):,} rows to {output} "
             f"elapsed={time.perf_counter() - started:.1f}s",
